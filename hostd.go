@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -55,19 +56,29 @@ type HostServer struct {
 	activeConns            map[string]int
 	sandboxes              map[string]SandboxRecord
 	migratedTo             map[string]string
-	dirtySandboxes         map[string]bool
-	lastExportAt           map[string]time.Time
-	sbxLocksMu             sync.Mutex
-	sbxLocks               map[string]*sync.Mutex
-	recentEvents           []ActivityEvent
-	store                  Store
-	engine                 SandboxEngine
-	controlPlaneURL        string
-	poolServiceURL         string
-	minClientVersion       string
-	httpClient             *http.Client
-	stopCh                 chan struct{}
-	stopOnce               sync.Once
+	// prestaged holds warm Phase 1 pre-copies (Two-Phase Pre-Copy live migration) received from a
+	// source host via POST /__internal/prestage. They are not active sandboxes and are not owned
+	// in the Store until the Phase 2 delta cutover (POST /__internal/hydrate with Prestaged=true).
+	prestaged map[string]prestagedSandbox
+	// inflightMutations counts exec / cp requests currently running inside each sandbox so the
+	// Phase 2 freeze can let them finish before exporting the delta.
+	inflightMutations map[string]int
+	// testHookAfterPrestage (tests only) runs on the source host after Phase 1 completes and
+	// before the Phase 2 freeze starts.
+	testHookAfterPrestage func(sandboxID string)
+	dirtySandboxes        map[string]bool
+	lastExportAt          map[string]time.Time
+	sbxLocksMu            sync.Mutex
+	sbxLocks              map[string]*sync.Mutex
+	recentEvents          []ActivityEvent
+	store                 Store
+	engine                SandboxEngine
+	controlPlaneURL       string
+	poolServiceURL        string
+	minClientVersion      string
+	httpClient            *http.Client
+	stopCh                chan struct{}
+	stopOnce              sync.Once
 }
 
 // NewHostServer initializes a HostServer for the given host session ID.
@@ -106,6 +117,8 @@ func NewHostServer(hostID string, store Store, engine SandboxEngine, maxDensity 
 		activeConns:           make(map[string]int),
 		sandboxes:             make(map[string]SandboxRecord),
 		migratedTo:            make(map[string]string),
+		prestaged:             make(map[string]prestagedSandbox),
+		inflightMutations:     make(map[string]int),
 		dirtySandboxes:        make(map[string]bool),
 		lastExportAt:          make(map[string]time.Time),
 		sbxLocks:              make(map[string]*sync.Mutex),
@@ -700,6 +713,11 @@ func (h *HostServer) retireEmptyHost(ctx context.Context, reason string) {
 			return
 		}
 	}
+	if len(h.prestaged) > 0 {
+		// A warm pre-copy is waiting for its Phase 2 cutover; keep this host alive.
+		h.mu.Unlock()
+		return
+	}
 	h.retired = true
 	h.hadSandboxes = false
 	h.emptySince = time.Now().UTC()
@@ -756,7 +774,7 @@ func (h *HostServer) SyncStateAndHeartbeat(ctx context.Context) error {
 	}
 	h.lastHeartbeatAt = time.Now().UTC()
 	rec := h.snapshotHostRecordLocked()
-	shouldRetireEmpty := rec.ActiveSandboxes == 0 && (h.hadSandboxes || (!h.emptySince.IsZero() && time.Since(h.emptySince) > 15*time.Second))
+	shouldRetireEmpty := rec.ActiveSandboxes == 0 && len(h.prestaged) == 0 && (h.hadSandboxes || (!h.emptySince.IsZero() && time.Since(h.emptySince) > 15*time.Second))
 	if shouldRetireEmpty {
 		h.mu.Unlock()
 		h.retireEmptyHost(ctx, "empty_auto_scale_down")
@@ -884,7 +902,9 @@ func (h *HostServer) exportSandboxOverlayToStoreLocked(ctx context.Context, rec 
 	if h.IsCrashed() {
 		return ErrHostCrashed
 	}
-	isBackgroundSync := reason == "periodic" || reason == "post_exec" || reason == "post_cp"
+	// post_migrate_checkpoint: asynchronous full GCS checkpoint after a Two-Phase Pre-Copy cutover.
+	isPostMigrateCheckpoint := reason == "post_migrate_checkpoint"
+	isBackgroundSync := reason == "periodic" || reason == "post_exec" || reason == "post_cp" || isPostMigrateCheckpoint
 	if isBackgroundSync {
 		h.mu.RLock()
 		cur, ok := h.sandboxes[rec.SandboxID]
@@ -920,6 +940,11 @@ func (h *HostServer) exportSandboxOverlayToStoreLocked(ctx context.Context, rec 
 		_ = h.engine.Quiesce(ctx, rec.SandboxID)
 		rec.OverlayPath = fmt.Sprintf("persistence/%s/overlay-e%d.tar", rec.SandboxID, rec.Epoch)
 	}
+	if isPostMigrateCheckpoint {
+		// The record still points at the source host's last (pre-delta) overlay; write a fresh
+		// epoch-scoped overlay without quiescing the running sandbox.
+		rec.OverlayPath = fmt.Sprintf("persistence/%s/overlay-e%d.tar", rec.SandboxID, rec.Epoch)
+	}
 	overlayPath := rec.OverlayPath
 	if overlayPath == "" {
 		overlayPath = fmt.Sprintf("persistence/%s/overlay.tar", rec.SandboxID)
@@ -948,7 +973,7 @@ func (h *HostServer) exportSandboxOverlayToStoreLocked(ctx context.Context, rec 
 	}
 	h.lastExportAt[rec.SandboxID] = now
 	h.mu.Unlock()
-	if reason == "periodic" || (isBackgroundSync && prevOverlayPath != overlayPath) {
+	if reason == "periodic" || isPostMigrateCheckpoint || (isBackgroundSync && prevOverlayPath != overlayPath) {
 		_, _ = h.store.WriteJSONCAS(ctx, "sandboxes/"+rec.SandboxID+".json", rec, storeGen)
 	}
 	return nil
@@ -1000,7 +1025,7 @@ func (h *HostServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.hostID = reqHostID
 			boundID = reqHostID
 			justBound = true
-		} else if r.URL.Path == "/__session/create" || r.URL.Path == "/__internal/hydrate" || r.URL.Path == "/__session/exec" || r.URL.Path == "/__session/exec-stream" || r.URL.Path == "/__session/port-forward" || isProxyReq {
+		} else if r.URL.Path == "/__session/create" || r.URL.Path == "/__internal/hydrate" || r.URL.Path == "/__internal/prestage" || r.URL.Path == "/__session/prestage" || r.URL.Path == "/__session/hydrate" || r.URL.Path == "/__session/exec" || r.URL.Path == "/__session/exec-stream" || r.URL.Path == "/__session/port-forward" || isProxyReq {
 			h.hostID = NewRandomID("host")
 			boundID = h.hostID
 			justBound = true
@@ -1088,8 +1113,10 @@ func (h *HostServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleStartOrResume(w, r)
 	case "/__session/delete":
 		h.handleDelete(w, r)
-	case "/__internal/hydrate":
+	case "/__internal/hydrate", "/__session/hydrate":
 		h.handleInternalHydrate(w, r)
+	case "/__internal/prestage", "/__session/prestage":
+		h.handleInternalPrestage(w, r)
 	case "/__internal/drain":
 		h.handleInternalDrain(w, r)
 	case "/__internal/check-overload":
@@ -1665,7 +1692,9 @@ func (h *HostServer) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	mergedEnv["SBX_ALLOW_EGRESS"] = strconv.FormatBool(effectiveAllowEgress)
 	timeout := time.Duration(req.TimeoutSec) * time.Second
+	endMutation := h.beginMutation(rec.SandboxID)
 	stdout, stderr, exitCode, pid, err := h.engine.Exec(r.Context(), rec.SandboxID, req.Command, req.Workdir, mergedEnv, req.Background, timeout)
+	endMutation()
 	if err != nil {
 		// Check if the sandbox was concurrently migrated or drained away while Exec was starting
 		if strings.Contains(err.Error(), "is not running") {
@@ -1815,6 +1844,7 @@ func (h *HostServer) execStreamWithRequest(w http.ResponseWriter, r *http.Reques
 		Epoch:     rec.Epoch,
 	})
 
+	endMutation := h.beginMutation(rec.SandboxID)
 	_, _, exitCode, err := h.engine.ExecStream(r.Context(), rec.SandboxID, req.Command, req.Workdir, mergedEnv, timeout, func(stream, data string) {
 		h.touchSandboxActivity(rec.SandboxID)
 		sendEvent(ExecStreamEvent{
@@ -1824,6 +1854,7 @@ func (h *HostServer) execStreamWithRequest(w http.ResponseWriter, r *http.Reques
 			HostID:    h.hostID,
 		})
 	})
+	endMutation()
 
 	durMs := time.Since(start).Milliseconds()
 	if err != nil && exitCode == -1 {
@@ -1935,6 +1966,14 @@ func (h *HostServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 			pr.Out.URL.Path = subPath
 			pr.Out.URL.RawPath = ""
 			pr.Out.Host = fmt.Sprintf("127.0.0.1:%d", port)
+			// Never leak Cloud Run service-account tokens, IAP assertions or IAP/UI cookies into
+			// the sandbox app. Callers pass app credentials via X-Sandbox-Authorization.
+			appAuth := pr.In.Header.Get("X-Sandbox-Authorization")
+			sanitizeProxyHeadersInPlace(pr.Out.Header, true)
+			pr.Out.Header.Del("X-Sandbox-Authorization")
+			if appAuth != "" {
+				pr.Out.Header.Set("Authorization", appAuth)
+			}
 		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -2081,7 +2120,9 @@ func (h *HostServer) handleCopyFile(w http.ResponseWriter, r *http.Request) {
 	h.beginSandboxActivity(rec.SandboxID)
 	defer h.endSandboxActivity(rec.SandboxID)
 
+	endMutation := h.beginMutation(rec.SandboxID)
 	resp, err := h.engine.CopyFile(r.Context(), rec.SandboxID, req)
+	endMutation()
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, ErrPathTraversal) {
@@ -2501,15 +2542,26 @@ func (h *HostServer) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		targetHost = NewRandomID("host")
 	}
 
-	sbxMu := h.getSandboxLock(rec.SandboxID)
-	sbxMu.Lock()
-
-	h.mu.Lock()
-	cur, exists := h.sandboxes[rec.SandboxID]
-	if !exists {
+	reason := "cli_migrate"
+	if req.PinnedHost || req.TargetHostID != "" {
+		reason = "cli_migrate_pinned"
+	}
+	pinned := req.PinnedHost
+	res, err := h.liveMigrateSandbox(r.Context(), rec.SandboxID, targetHost, liveMigrationOptions{
+		ExportReason:      "cli_migrate",
+		HydrateReason:     reason,
+		AllowFallbackHost: req.TargetHostID == "",
+		EventType:         "MIGRATE",
+		Prepare: func(cur *SandboxRecord) {
+			if pinned {
+				cur.PinnedHost = true
+			}
+		},
+	})
+	if errors.Is(err, ErrNotFound) {
+		h.mu.RLock()
 		migTarget := h.migratedTo[rec.SandboxID]
-		h.mu.Unlock()
-		sbxMu.Unlock()
+		h.mu.RUnlock()
 		if migTarget != "" && migTarget != h.hostID {
 			w.Header().Set("X-Sandbox-Host-Session", migTarget)
 			writeHostJSON(w, h, http.StatusConflict, MisdirectedSandboxError{
@@ -2523,66 +2575,13 @@ func (h *HostServer) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		writeHostJSON(w, h, http.StatusNotFound, map[string]any{"error": "sandbox no longer on host"})
 		return
 	}
-	cur.Status = StatusMigrating
-	if req.PinnedHost {
-		cur.PinnedHost = true
-	}
-	h.sandboxes[rec.SandboxID] = cur
-	rec = cur
-	h.mu.Unlock()
-
-	if err := h.exportSandboxOverlayToStoreLocked(r.Context(), &rec, "cli_migrate"); err != nil {
-		h.mu.Lock()
-		rec.Status = StatusRunning
-		h.sandboxes[rec.SandboxID] = rec
-		h.mu.Unlock()
-		_ = h.engine.Start(r.Context(), rec, "")
-		sbxMu.Unlock()
-		writeHostJSON(w, h, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-
-	reason := "cli_migrate"
-	if req.PinnedHost || req.TargetHostID != "" {
-		reason = "cli_migrate_pinned"
-	}
-	hydrated, err := h.sendHydrateToHost(r.Context(), targetHost, HydrateRequest{
-		Record:     rec,
-		OverlayTar: rec.OverlayPath,
-		Reason:     reason,
-	})
-	if err != nil && req.TargetHostID == "" {
-		fallbackHost := NewRandomID("host")
-		if h2, retryErr := h.sendHydrateToHost(r.Context(), fallbackHost, HydrateRequest{
-			Record:     rec,
-			OverlayTar: rec.OverlayPath,
-			Reason:     reason,
-		}); retryErr == nil {
-			hydrated = h2
-			err = nil
-		}
-	}
 	if err != nil {
-		h.mu.Lock()
-		rec.Status = StatusRunning
-		h.sandboxes[rec.SandboxID] = rec
-		h.mu.Unlock()
-		_ = h.engine.Start(r.Context(), rec, "")
-		sbxMu.Unlock()
 		writeHostJSON(w, h, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-
-	h.mu.Lock()
-	h.migratedTo[rec.SandboxID] = hydrated.HostID
-	delete(h.sandboxes, rec.SandboxID)
-	h.snapshotHostRecordLocked()
-	h.mu.Unlock()
-	_ = h.engine.Stop(r.Context(), rec.SandboxID)
-	sbxMu.Unlock()
 
 	_ = h.SyncStateAndHeartbeat(r.Context())
-	writeHostJSON(w, h, http.StatusOK, hydrated)
+	writeHostJSON(w, h, http.StatusOK, res.Hydrated)
 }
 
 func (h *HostServer) stopOrSuspendSandbox(ctx context.Context, sandboxID string, targetStatus SandboxStatus, reason string) (SandboxRecord, error) {
@@ -2742,7 +2741,26 @@ func (h *HostServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HostServer) hydrateSandboxInternal(ctx context.Context, rec SandboxRecord, overlayTarPath string, reason string, expectedGen int64) (SandboxRecord, error) {
+	return h.hydrateSandboxInternalWithOptions(ctx, rec, overlayTarPath, reason, expectedGen, nil)
+}
+
+// hydrateOptions carries live-migration specifics for hydrateSandboxInternalWithOptions.
+type hydrateOptions struct {
+	// Prestaged: Phase 2 of Two-Phase Pre-Copy. Apply DeltaTarPath + DeletedPaths over the warm
+	// prestaged copy instead of downloading the full overlay and cold-starting the container.
+	Prestaged    bool
+	DeltaTarPath string
+	DeletedPaths []string
+	DeltaBytes   int64
+	// MigrationStart / FreezeStart are the source host's Phase 1 / Phase 2 start times.
+	MigrationStart time.Time
+	FreezeStart    time.Time
+}
+
+func (h *HostServer) hydrateSandboxInternalWithOptions(ctx context.Context, rec SandboxRecord, overlayTarPath string, reason string, expectedGen int64, opts *hydrateOptions) (SandboxRecord, error) {
 	start := time.Now()
+	usePrestaged := opts != nil && opts.Prestaged
+	isLiveMigration := opts != nil && !opts.MigrationStart.IsZero()
 	if err := ValidateID(rec.SandboxID); err != nil {
 		return SandboxRecord{}, err
 	}
@@ -2776,6 +2794,14 @@ func (h *HostServer) hydrateSandboxInternal(ctx context.Context, rec SandboxReco
 			return SandboxRecord{}, ErrHostFull
 		}
 	}
+	_, hasPrestaged := h.prestaged[rec.SandboxID]
+	if usePrestaged && !hasPrestaged {
+		h.mu.Unlock()
+		return SandboxRecord{}, ErrNotPrestaged
+	}
+	// A full (non-delta) hydrate supersedes any stale warm pre-copy of this sandbox.
+	discardStalePrestage := hasPrestaged && !usePrestaged
+	delete(h.prestaged, rec.SandboxID)
 
 	if overlayTarPath == "" {
 		overlayTarPath = rec.OverlayPath
@@ -2812,24 +2838,40 @@ func (h *HostServer) hydrateSandboxInternal(ctx context.Context, rec SandboxReco
 	SetInstanceBusyState(true)
 	h.mu.Unlock()
 
-	var localTar string
-	var cleanup func() error
-	if h.store != nil && overlayTarPath != "" {
-		if p, cleanFn, err := h.store.LocalBlobPath(ctx, overlayTarPath, false); err == nil {
-			localTar = p
-			cleanup = cleanFn
+	if discardStalePrestage {
+		_ = h.engine.Stop(ctx, rec.SandboxID)
+	}
+	if usePrestaged {
+		// Phase 2 cutover: the container is already warm with the base filesystem; apply only the
+		// delta (modified files + deletions) - no GCS download, no cold start.
+		if err := h.engine.ApplyDeltaTar(ctx, rec, opts.DeltaTarPath, opts.DeletedPaths); err != nil {
+			_ = h.engine.Stop(ctx, rec.SandboxID)
+			h.mu.Lock()
+			delete(h.sandboxes, rec.SandboxID)
+			h.snapshotHostRecordLocked()
+			h.mu.Unlock()
+			return SandboxRecord{}, fmt.Errorf("apply pre-copy delta: %w", err)
 		}
-	}
-	if cleanup != nil {
-		defer func() { _ = cleanup() }()
-	}
-
-	if err := h.engine.Start(ctx, rec, localTar); err != nil {
-		h.mu.Lock()
-		delete(h.sandboxes, rec.SandboxID)
-		h.snapshotHostRecordLocked()
-		h.mu.Unlock()
-		return SandboxRecord{}, err
+	} else {
+		var localTar string
+		var cleanup func() error
+		if h.store != nil && overlayTarPath != "" {
+			if p, cleanFn, err := h.store.LocalBlobPath(ctx, overlayTarPath, false); err == nil {
+				localTar = p
+				cleanup = cleanFn
+			}
+		}
+		err := h.engine.Start(ctx, rec, localTar)
+		if cleanup != nil {
+			_ = cleanup()
+		}
+		if err != nil {
+			h.mu.Lock()
+			delete(h.sandboxes, rec.SandboxID)
+			h.snapshotHostRecordLocked()
+			h.mu.Unlock()
+			return SandboxRecord{}, err
+		}
 	}
 	rec.Status = StatusRunning
 	if lp, ok := h.engine.(*LocalProcessEngine); ok && strings.Contains(strings.ToLower(rec.Template), "postgres") {
@@ -2845,7 +2887,31 @@ func (h *HostServer) hydrateSandboxInternal(ctx context.Context, rec SandboxReco
 	_, _, _, _, _ = h.engine.Exec(ctx, rec.SandboxID, []string{"sh", "-c", "if [ -f /workspace/.sbx_init.sh ]; then sh /workspace/.sbx_init.sh >/tmp/sbx_init.log 2>&1 </dev/null & fi"}, "/workspace", rec.Env, false, 10*time.Second)
 
 	downtimeMs := time.Since(start).Milliseconds()
-	rec.TotalDowntimeMs += downtimeMs
+	// For live migrations the downtime is the whole freeze window, which starts on the source host
+	// (FreezeStart) before the delta/overlay export. Clamp against clock skew between hosts.
+	freezeMs := downtimeMs
+	totalMs := downtimeMs
+	migrationMode := ""
+	if isLiveMigration {
+		if !opts.FreezeStart.IsZero() {
+			if f := time.Since(opts.FreezeStart).Milliseconds(); f >= downtimeMs && f < int64(time.Hour/time.Millisecond) {
+				freezeMs = f
+			}
+		}
+		if t := time.Since(opts.MigrationStart).Milliseconds(); t >= freezeMs && t < int64(time.Hour/time.Millisecond) {
+			totalMs = t
+		} else {
+			totalMs = freezeMs
+		}
+		migrationMode = MigrationModeGCSFull
+		if usePrestaged {
+			migrationMode = MigrationModePrestagedDelta
+		}
+		rec.LastMigrationFreezeMs = freezeMs
+		rec.LastMigrationTotalMs = totalMs
+		rec.LastMigrationMode = migrationMode
+	}
+	rec.TotalDowntimeMs += freezeMs
 
 	if h.store != nil {
 		if expectedGen > 0 {
@@ -2880,8 +2946,14 @@ func (h *HostServer) hydrateSandboxInternal(ctx context.Context, rec SandboxReco
 	}
 	h.mu.Lock()
 	h.sandboxes[rec.SandboxID] = rec
-	h.recordEventLocked(evtType, rec.SandboxID, h.hostID, fmt.Sprintf("%dms", downtimeMs),
-		fmt.Sprintf("Hydrated sandbox %s on %s (from %s, reason=%s, epoch=%d) in %dms", rec.SandboxID, h.hostID, prevHost, reason, rec.Epoch, downtimeMs))
+	evtMsg := fmt.Sprintf("Hydrated sandbox %s on %s (from %s, reason=%s, epoch=%d) in %dms", rec.SandboxID, h.hostID, prevHost, reason, rec.Epoch, downtimeMs)
+	if isLiveMigration {
+		evtMsg += fmt.Sprintf(" mode=%s freeze_ms=%d total_ms=%d", migrationMode, freezeMs, totalMs)
+		if usePrestaged {
+			evtMsg += fmt.Sprintf(" delta_bytes=%d deleted_paths=%d", opts.DeltaBytes, len(opts.DeletedPaths))
+		}
+	}
+	h.recordEventLocked(evtType, rec.SandboxID, h.hostID, fmt.Sprintf("%dms", freezeMs), evtMsg)
 	hostRecAfter := h.snapshotHostRecordLocked()
 	h.appendMetricsSampleLocked(hostRecAfter)
 	if updatedSbx, exists := h.sandboxes[rec.SandboxID]; exists {
@@ -2889,15 +2961,41 @@ func (h *HostServer) hydrateSandboxInternal(ctx context.Context, rec SandboxReco
 	}
 	h.mu.Unlock()
 
+	if usePrestaged && h.store != nil {
+		// GCS durability without blocking the cutover: checkpoint the full overlay in the background.
+		go h.checkpointAfterPrestagedCutover(rec.SandboxID)
+	}
 	_ = h.SyncStateAndHeartbeat(ctx)
 	return rec, nil
 }
 
 func (h *HostServer) handleInternalHydrate(w http.ResponseWriter, r *http.Request) {
 	var req HydrateRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
+	// Inline Phase 2 delta tars (base64 in JSON) may be up to maxInlineDeltaBytes.
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxInlineDeltaBytes*2+(4<<20))).Decode(&req); err != nil {
 		writeHostJSON(w, h, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
+	}
+	var opts *hydrateOptions
+	if req.Prestaged || req.MigrationStartUnixMs > 0 {
+		opts = &hydrateOptions{Prestaged: req.Prestaged, DeletedPaths: req.DeletedPaths}
+		if req.MigrationStartUnixMs > 0 {
+			opts.MigrationStart = time.UnixMilli(req.MigrationStartUnixMs)
+		}
+		if req.FreezeStartUnixMs > 0 {
+			opts.FreezeStart = time.UnixMilli(req.FreezeStartUnixMs)
+		}
+	}
+	if req.Prestaged {
+		deltaPath, n, cleanup, err := h.materializeDeltaTar(r.Context(), req)
+		if err != nil {
+			writeHostJSON(w, h, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		defer cleanup()
+		opts.DeltaTarPath = deltaPath
+		opts.DeltaBytes = n
+		req.DeltaTar = nil
 	}
 	var gen int64 = -1
 	if h.store != nil {
@@ -2909,13 +3007,15 @@ func (h *HostServer) handleInternalHydrate(w http.ResponseWriter, r *http.Reques
 			}
 		}
 	}
-	hydrated, err := h.hydrateSandboxInternal(r.Context(), req.Record, req.OverlayTar, req.Reason, gen)
+	hydrated, err := h.hydrateSandboxInternalWithOptions(r.Context(), req.Record, req.OverlayTar, req.Reason, gen, opts)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, ErrHostFull) {
 			status = http.StatusTooManyRequests
 		} else if errors.Is(err, ErrHostDraining) {
 			status = http.StatusServiceUnavailable
+		} else if errors.Is(err, ErrNotPrestaged) {
+			status = http.StatusPreconditionFailed
 		}
 		writeHostJSON(w, h, status, map[string]any{"error": err.Error()})
 		return
@@ -3034,80 +3134,36 @@ func (h *HostServer) checkResourceOverloadAndShed(ctx context.Context) (map[stri
 	victim := running[0]
 	h.mu.Unlock()
 
-	sbxMu := h.getSandboxLock(victim.SandboxID)
-	sbxMu.Lock()
-
-	h.mu.Lock()
-	cur, ok := h.sandboxes[victim.SandboxID]
-	if !ok || cur.Status != StatusRunning {
-		h.mu.Unlock()
-		sbxMu.Unlock()
-		return map[string]string{}, nil
-	}
-	cur.Status = StatusMigrating
-	h.sandboxes[victim.SandboxID] = cur
-	victim = cur
-	h.mu.Unlock()
-
 	targets := h.requestMigrationTargets(ctx, []string{victim.SandboxID}, "hot_host_shedding")
 	targetHost := targets[victim.SandboxID]
 	if targetHost == "" || targetHost == h.hostID {
 		targetHost = NewRandomID("host")
 	}
 
-	if err := h.exportSandboxOverlayToStoreLocked(ctx, &victim, "drain_hot_host_shedding"); err != nil {
-		h.mu.Lock()
-		victim.Status = StatusRunning
-		h.sandboxes[victim.SandboxID] = victim
-		h.mu.Unlock()
-		_ = h.engine.Start(ctx, victim, "")
-		sbxMu.Unlock()
-		return map[string]string{}, err
-	}
-
-	hydrated, err := h.sendHydrateToHost(ctx, targetHost, HydrateRequest{
-		Record:     victim,
-		OverlayTar: victim.OverlayPath,
-		Reason:     "hot_host_shedding",
+	// Two-Phase Pre-Copy: the victim keeps serving during the warm pre-copy, then freezes briefly
+	// for the delta cutover (falls back to the full GCS overlay path if pre-staging fails).
+	res, err := h.liveMigrateSandbox(ctx, victim.SandboxID, targetHost, liveMigrationOptions{
+		ExportReason:      "drain_hot_host_shedding",
+		HydrateReason:     "hot_host_shedding",
+		AllowFallbackHost: true,
 	})
-	if err != nil {
-		fallbackHost := NewRandomID("host")
-		if h2, retryErr := h.sendHydrateToHost(ctx, fallbackHost, HydrateRequest{
-			Record:     victim,
-			OverlayTar: victim.OverlayPath,
-			Reason:     "hot_host_shedding",
-		}); retryErr == nil {
-			hydrated = h2
-			targetHost = h2.HostID
-			err = nil
-		}
-	} else if hydrated.HostID != "" {
-		targetHost = hydrated.HostID
+	if errors.Is(err, ErrNotFound) {
+		return map[string]string{}, nil
 	}
 	if err != nil {
-		h.mu.Lock()
-		victim.Status = StatusRunning
-		h.sandboxes[victim.SandboxID] = victim
-		h.mu.Unlock()
-		_ = h.engine.Start(ctx, victim, "")
-		sbxMu.Unlock()
 		return map[string]string{}, err
 	}
+	targetHost = res.TargetHost
 
 	h.mu.Lock()
-	h.migratedTo[victim.SandboxID] = targetHost
-	delete(h.sandboxes, victim.SandboxID)
 	h.hotMigrationsTriggered++
 	h.lastShedSandboxes[victim.SandboxID] = targetHost
-	h.recordEventLocked("HOT_MIGRATE", victim.SandboxID, targetHost, "",
-		fmt.Sprintf("Proactively live-migrated %s (%dMiB) from overloaded host %s (mem=%.1f%%, cpu=%.1f%%) -> %s",
-			victim.SandboxID, victim.UsedMemoryBytes/(1<<20), h.hostID, state.UsedMemoryPct, state.CPUUsagePct, targetHost))
+	h.recordEventLocked("HOT_MIGRATE", victim.SandboxID, targetHost, fmt.Sprintf("%dms", res.FreezeMs),
+		fmt.Sprintf("Proactively live-migrated %s (%dMiB) from overloaded host %s (mem=%.1f%%, cpu=%.1f%%) -> %s (mode=%s freeze_ms=%d total_ms=%d)",
+			victim.SandboxID, victim.UsedMemoryBytes/(1<<20), h.hostID, state.UsedMemoryPct, state.CPUUsagePct, targetHost, res.Mode, res.FreezeMs, res.TotalMs))
 	afterRec := h.snapshotHostRecordLocked()
 	h.appendMetricsSampleLocked(afterRec)
 	h.mu.Unlock()
-
-	_ = h.engine.Stop(ctx, victim.SandboxID)
-	sbxMu.Unlock()
 
 	_ = h.SyncStateAndHeartbeat(ctx)
 	return map[string]string{victim.SandboxID: targetHost}, nil
@@ -3158,10 +3214,10 @@ func (h *HostServer) DrainAndEvacuate(ctx context.Context, reason string, preset
 	h.status = HostDraining
 	var toEvacuate []SandboxRecord
 	var ids []string
-	for k, s := range h.sandboxes {
+	// Sandboxes stay RUNNING (serving exec/proxy traffic) during their Phase 1 warm pre-copy;
+	// liveMigrateSandbox marks each one MIGRATING only for its brief Phase 2 freeze.
+	for _, s := range h.sandboxes {
 		if s.Status == StatusRunning {
-			s.Status = StatusMigrating
-			h.sandboxes[k] = s
 			toEvacuate = append(toEvacuate, s)
 			ids = append(ids, s.SandboxID)
 		}
@@ -3195,68 +3251,31 @@ func (h *HostServer) DrainAndEvacuate(ctx context.Context, reason string, preset
 	migrated := make(map[string]string)
 	var firstErr error
 	for _, rec := range toEvacuate {
-		sbxMu := h.getSandboxLock(rec.SandboxID)
-		sbxMu.Lock()
-
 		targetHost := targets[rec.SandboxID]
 		if targetHost == "" || targetHost == h.hostID {
 			targetHost = NewRandomID("host")
-		}
-		if err := h.exportSandboxOverlayToStoreLocked(ctx, &rec, "drain_"+reason); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			h.mu.Lock()
-			rec.Status = StatusRunning
-			h.sandboxes[rec.SandboxID] = rec
-			h.mu.Unlock()
-			_ = h.engine.Start(ctx, rec, "")
-			sbxMu.Unlock()
-			continue
 		}
 		hydrateReason := reason
 		if rec.PinnedHost {
 			hydrateReason = "cli_migrate_pinned"
 		}
-		hydrated, err := h.sendHydrateToHost(ctx, targetHost, HydrateRequest{
-			Record:     rec,
-			OverlayTar: rec.OverlayPath,
-			Reason:     hydrateReason,
+		res, err := h.liveMigrateSandbox(ctx, rec.SandboxID, targetHost, liveMigrationOptions{
+			ExportReason:      "drain_" + reason,
+			HydrateReason:     hydrateReason,
+			AllowFallbackHost: true,
+			EventType:         "MIGRATE",
 		})
-		if err != nil {
-			// Fallback: mint a fresh host session and retry once
-			fallbackHost := NewRandomID("host")
-			if h2, retryErr := h.sendHydrateToHost(ctx, fallbackHost, HydrateRequest{
-				Record:     rec,
-				OverlayTar: rec.OverlayPath,
-				Reason:     hydrateReason,
-			}); retryErr == nil {
-				targetHost = h2.HostID
-				err = nil
-			}
-		} else if hydrated.HostID != "" {
-			targetHost = hydrated.HostID
+		if errors.Is(err, ErrNotFound) {
+			// Concurrently suspended/stopped/deleted: nothing left to evacuate.
+			continue
 		}
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
-			h.mu.Lock()
-			rec.Status = StatusRunning
-			h.sandboxes[rec.SandboxID] = rec
-			h.mu.Unlock()
-			_ = h.engine.Start(ctx, rec, "")
-			sbxMu.Unlock()
 			continue
 		}
-		// Remove from local map and record redirect BEFORE stopping engine so concurrent requests get HTTP 409 immediately
-		h.mu.Lock()
-		h.migratedTo[rec.SandboxID] = targetHost
-		delete(h.sandboxes, rec.SandboxID)
-		h.mu.Unlock()
-		_ = h.engine.Stop(ctx, rec.SandboxID)
-		sbxMu.Unlock()
-		migrated[rec.SandboxID] = targetHost
+		migrated[rec.SandboxID] = res.TargetHost
 	}
 
 	h.mu.Lock()
@@ -3361,4 +3380,649 @@ func (h *HostServer) sendHydrateToHost(ctx context.Context, targetHostID string,
 		return SandboxRecord{}, err
 	}
 	return hydrated, nil
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two-Phase Pre-Copy live migration
+//
+//	Phase 1 (zero downtime): the source exports the base filesystem WITHOUT holding sbxMu while the
+//	sandbox stays RUNNING, and streams it to the target (POST /__internal/prestage). The target
+//	unpacks it, warms the container and keeps it in h.prestaged (not active, not owned in the Store).
+//
+//	Phase 2 (brief freeze): the source takes sbxMu, marks the sandbox MIGRATING, lets in-flight
+//	exec/cp finish, flushes (/workspace/.sbx_pre_migrate.sh, PostgreSQL CHECKPOINT + clean stop),
+//	exports only the delta since Phase 1 began, and sends it inline to the target
+//	(POST /__internal/hydrate, Prestaged=true). The target applies the delta, relaunches background
+//	commands, CAS-writes ownership and serves; the full GCS checkpoint happens asynchronously.
+//
+// If Phase 1 or the delta cutover fails, migration falls back to the full stop-and-copy path
+// (overlay tar through the Store + standard hydrate).
+// ---------------------------------------------------------------------------------------------
+
+// ErrNotPrestaged is returned by a Prestaged hydrate when the target holds no warm pre-copy.
+var ErrNotPrestaged = errors.New("sandbox is not prestaged on this host")
+
+const (
+	// maxInlinePrestageBytes is the largest base tar streamed directly in the prestage request
+	// body (Cloud Run HTTP/1 request bodies are capped at 32 MiB); larger tars are staged in the Store.
+	maxInlinePrestageBytes = 30 << 20
+	// maxInlineDeltaBytes is the largest delta tar sent inline (base64 in JSON) in the Phase 2
+	// hydrate request; larger deltas are staged in the Store.
+	maxInlineDeltaBytes = 20 << 20
+	// maxPrestageTarBytes bounds a received base tar.
+	maxPrestageTarBytes = 16 << 30
+	// prestageTimeout bounds Phase 1 (export + transfer + warm start).
+	prestageTimeout = 5 * time.Minute
+	// prestageTTL is how long a target keeps an unclaimed warm pre-copy.
+	prestageTTL = 3 * time.Minute
+	// migrationInflightWait bounds how long the Phase 2 freeze waits for in-flight exec/cp.
+	migrationInflightWait = 2 * time.Second
+)
+
+// prestagedSandbox is a warm Phase 1 pre-copy awaiting its Phase 2 delta cutover.
+type prestagedSandbox struct {
+	Record       SandboxRecord
+	SourceHostID string
+	StagedAt     time.Time
+}
+
+// liveMigrationOptions configures liveMigrateSandbox for its callers (CLI migrate, drain, hot shedding).
+type liveMigrationOptions struct {
+	// ExportReason is passed to exportSandboxOverlayToStoreLocked on the full (fallback) path.
+	ExportReason string
+	// HydrateReason is sent to the target host (cli_migrate, cli_migrate_pinned, hot_host_shedding, ...).
+	HydrateReason string
+	// AllowFallbackHost retries a failed full hydrate once on a freshly minted host session.
+	AllowFallbackHost bool
+	// EventType, if set, records a source-side event with freeze_ms / total_ms.
+	EventType string
+	// Prepare mutates the record at the start of the freeze (e.g. pinning).
+	Prepare func(*SandboxRecord)
+}
+
+// liveMigrationResult describes a completed live migration.
+type liveMigrationResult struct {
+	Hydrated   SandboxRecord
+	TargetHost string
+	Mode       string
+	FreezeMs   int64
+	TotalMs    int64
+}
+
+func (h *HostServer) beginMutation(sandboxID string) func() {
+	h.mu.Lock()
+	h.inflightMutations[sandboxID]++
+	h.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			h.mu.Lock()
+			if h.inflightMutations[sandboxID] > 1 {
+				h.inflightMutations[sandboxID]--
+			} else {
+				delete(h.inflightMutations, sandboxID)
+			}
+			h.mu.Unlock()
+		})
+	}
+}
+
+// waitForInflightMutations waits (bounded) for in-flight exec/cp requests in sandboxID to finish
+// so their writes are captured by the Phase 2 delta.
+func (h *HostServer) waitForInflightMutations(sandboxID string, maxWait time.Duration) {
+	deadline := time.Now().Add(maxWait)
+	for {
+		h.mu.RLock()
+		n := h.inflightMutations[sandboxID]
+		h.mu.RUnlock()
+		if n <= 0 || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func isPostgresRecord(rec SandboxRecord) bool {
+	return strings.Contains(strings.ToLower(rec.Template), "postgres") || rec.PostgresPort > 0
+}
+
+// runPreMigrateFlush runs at the start of the Phase 2 freeze so dirty state lands in the delta:
+// the guest's /workspace/.sbx_pre_migrate.sh hook (if present), and for PostgreSQL a CHECKPOINT +
+// clean shutdown (engine.Quiesce), which makes the copied pgdata consistent.
+func (h *HostServer) runPreMigrateFlush(ctx context.Context, rec SandboxRecord) {
+	if _, err := h.engine.CopyFile(ctx, rec.SandboxID, FileCopyRequest{
+		SandboxID: rec.SandboxID,
+		Direction: "download",
+		Path:      "/workspace/.sbx_pre_migrate.sh",
+	}); err == nil {
+		_, _, _, _, _ = h.engine.Exec(ctx, rec.SandboxID,
+			[]string{"sh", "-c", "sh /workspace/.sbx_pre_migrate.sh >/tmp/sbx_pre_migrate.log 2>&1 </dev/null"},
+			"/workspace", rec.Env, false, 10*time.Second)
+	}
+	if isPostgresRecord(rec) {
+		_ = h.engine.Quiesce(ctx, rec.SandboxID)
+	}
+}
+
+// resolvePoolURL returns the sandbox-pool service URL used for host-to-host requests.
+func (h *HostServer) resolvePoolURL(ctx context.Context) (string, error) {
+	h.mu.RLock()
+	poolURL := h.poolServiceURL
+	h.mu.RUnlock()
+	if poolURL == "" && h.store != nil {
+		var cfg FleetConfig
+		if _, ok, _ := h.store.ReadJSON(ctx, "fleet/config.json", &cfg); ok && cfg.PoolServiceURL != "" {
+			poolURL = strings.TrimRight(cfg.PoolServiceURL, "/")
+		}
+	}
+	if poolURL == "" {
+		return "", errors.New("pool_service_url is not configured for cross-host migration")
+	}
+	return poolURL, nil
+}
+
+// liveMigrateSandbox migrates sandboxID to targetHost using Two-Phase Pre-Copy (falling back to the
+// full Store-based stop-and-copy path). The caller must NOT hold the sandbox's sbxMu. On failure the
+// sandbox keeps running on this host. ErrNotFound means it is no longer running here.
+func (h *HostServer) liveMigrateSandbox(ctx context.Context, sandboxID, targetHost string, opts liveMigrationOptions) (liveMigrationResult, error) {
+	migrationStart := time.Now()
+	h.mu.RLock()
+	rec, ok := h.sandboxes[sandboxID]
+	h.mu.RUnlock()
+	if !ok || rec.Status != StatusRunning {
+		return liveMigrationResult{}, fmt.Errorf("%w: sandbox %s is not running on %s", ErrNotFound, sandboxID, h.hostID)
+	}
+
+	// Phase 1: warm pre-copy. No sbxMu; the sandbox stays RUNNING and keeps serving traffic.
+	prestaged := false
+	if _, err := h.prestageToHost(ctx, targetHost, rec, opts.HydrateReason); err == nil {
+		prestaged = true
+	} else {
+		h.engine.AppendLog(sandboxID, fmt.Sprintf("[migrate] pre-copy to %s failed, falling back to full copy: %v", targetHost, err))
+	}
+	if prestaged && h.testHookAfterPrestage != nil {
+		h.testHookAfterPrestage(sandboxID)
+	}
+
+	// Phase 2: brief freeze + delta cutover.
+	sbxMu := h.getSandboxLock(sandboxID)
+	sbxMu.Lock()
+	freezeStart := time.Now()
+	h.mu.Lock()
+	cur, exists := h.sandboxes[sandboxID]
+	if !exists || cur.Status != StatusRunning {
+		h.mu.Unlock()
+		sbxMu.Unlock()
+		return liveMigrationResult{}, fmt.Errorf("%w: sandbox %s is no longer running on %s", ErrNotFound, sandboxID, h.hostID)
+	}
+	cur.Status = StatusMigrating
+	if opts.Prepare != nil {
+		opts.Prepare(&cur)
+	}
+	h.sandboxes[sandboxID] = cur
+	rec = cur
+	h.mu.Unlock()
+
+	restore := func(err error) (liveMigrationResult, error) {
+		h.mu.Lock()
+		rec.Status = StatusRunning
+		h.sandboxes[sandboxID] = rec
+		h.mu.Unlock()
+		_ = h.engine.Start(ctx, rec, "")
+		sbxMu.Unlock()
+		return liveMigrationResult{}, err
+	}
+
+	h.waitForInflightMutations(sandboxID, migrationInflightWait)
+	h.runPreMigrateFlush(ctx, rec)
+
+	mode := MigrationModeGCSFull
+	var hydrated SandboxRecord
+	if prestaged {
+		var err error
+		hydrated, err = h.sendPrestagedDelta(ctx, targetHost, rec, opts.HydrateReason, migrationStart, freezeStart)
+		if err == nil {
+			mode = MigrationModePrestagedDelta
+		} else {
+			h.engine.AppendLog(sandboxID, fmt.Sprintf("[migrate] delta cutover to %s failed, falling back to full copy: %v", targetHost, err))
+		}
+	}
+	if mode != MigrationModePrestagedDelta {
+		if err := h.exportSandboxOverlayToStoreLocked(ctx, &rec, opts.ExportReason); err != nil {
+			return restore(err)
+		}
+		req := HydrateRequest{
+			Record:               rec,
+			OverlayTar:           rec.OverlayPath,
+			Reason:               opts.HydrateReason,
+			MigrationStartUnixMs: migrationStart.UnixMilli(),
+			FreezeStartUnixMs:    freezeStart.UnixMilli(),
+		}
+		var err error
+		hydrated, err = h.sendHydrateToHost(ctx, targetHost, req)
+		if err != nil && opts.AllowFallbackHost {
+			if h2, retryErr := h.sendHydrateToHost(ctx, NewRandomID("host"), req); retryErr == nil {
+				hydrated, err = h2, nil
+			}
+		}
+		if err != nil {
+			return restore(err)
+		}
+	}
+	if hydrated.HostID != "" {
+		targetHost = hydrated.HostID
+	}
+
+	// Remove from local map and record the redirect BEFORE stopping the engine so concurrent
+	// requests get HTTP 409 (misdirected_sandbox -> targetHost) immediately.
+	h.mu.Lock()
+	h.migratedTo[sandboxID] = targetHost
+	delete(h.sandboxes, sandboxID)
+	delete(h.dirtySandboxes, sandboxID)
+	h.snapshotHostRecordLocked()
+	h.mu.Unlock()
+	_ = h.engine.Stop(ctx, sandboxID)
+	freezeMs := time.Since(freezeStart).Milliseconds()
+	totalMs := time.Since(migrationStart).Milliseconds()
+	if opts.EventType != "" {
+		h.mu.Lock()
+		h.recordEventLocked(opts.EventType, sandboxID, targetHost, fmt.Sprintf("%dms", freezeMs),
+			fmt.Sprintf("Live-migrated %s from %s -> %s (mode=%s freeze_ms=%d total_ms=%d reason=%s)",
+				sandboxID, h.hostID, targetHost, mode, freezeMs, totalMs, opts.HydrateReason))
+		h.mu.Unlock()
+	}
+	sbxMu.Unlock()
+	return liveMigrationResult{Hydrated: hydrated, TargetHost: targetHost, Mode: mode, FreezeMs: freezeMs, TotalMs: totalMs}, nil
+}
+
+// authorizeHostRequest sets session routing and (on Cloud Run) ID-token auth headers.
+func authorizeHostRequest(ctx context.Context, req *http.Request, poolURL, targetHostID string) {
+	req.Header.Set("X-Serverless-Session-Id", targetHostID)
+	if strings.HasPrefix(poolURL, "https://") {
+		if tok, err := GetIDToken(ctx, poolURL); err == nil && tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+	}
+}
+
+// prestageToHost is Phase 1: export the base filesystem of a RUNNING sandbox (no sbxMu) and stream
+// it to targetHostID's POST /__internal/prestage.
+func (h *HostServer) prestageToHost(ctx context.Context, targetHostID string, rec SandboxRecord, reason string) (PrestageResponse, error) {
+	if h.engine == nil {
+		return PrestageResponse{}, errors.New("no sandbox engine")
+	}
+	poolURL, err := h.resolvePoolURL(ctx)
+	if err != nil {
+		return PrestageResponse{}, err
+	}
+	tf, err := os.CreateTemp("", "sbx-prestage-*.tar")
+	if err != nil {
+		return PrestageResponse{}, err
+	}
+	basePath := tf.Name()
+	_ = tf.Close()
+	defer os.Remove(basePath)
+	if err := h.engine.ExportTar(ctx, rec, basePath); err != nil {
+		return PrestageResponse{}, fmt.Errorf("export base tar: %w", err)
+	}
+	st, err := os.Stat(basePath)
+	if err != nil {
+		return PrestageResponse{}, err
+	}
+
+	meta := PrestageRequest{Record: rec, Reason: reason, SourceHostID: h.hostID}
+	reqCtx, cancel := context.WithTimeout(ctx, prestageTimeout)
+	defer cancel()
+	var body io.Reader
+	contentType := ""
+	if st.Size() <= maxInlinePrestageBytes || h.store == nil {
+		// Stream the base tar directly host-to-host as multipart/form-data.
+		pr, pw := io.Pipe()
+		mw := multipart.NewWriter(pw)
+		contentType = mw.FormDataContentType()
+		go func() {
+			pw.CloseWithError(func() error {
+				metaJSON, err := json.Marshal(meta)
+				if err != nil {
+					return err
+				}
+				if err := mw.WriteField("record", string(metaJSON)); err != nil {
+					return err
+				}
+				part, err := mw.CreateFormFile("base_tar", "base.tar")
+				if err != nil {
+					return err
+				}
+				f, err := os.Open(basePath)
+				if err != nil {
+					return err
+				}
+				defer f.Close()
+				if _, err := io.Copy(part, f); err != nil {
+					return err
+				}
+				return mw.Close()
+			}())
+		}()
+		defer pr.Close()
+		body = pr
+	} else {
+		// Above the inline request-size limit: stage the base tar in the Store (Phase 1 is not
+		// latency-critical) and send a reference.
+		blob := fmt.Sprintf("persistence/%s/prestage-e%d-%s.tar", rec.SandboxID, rec.Epoch, NewRandomID(""))
+		f, err := os.Open(basePath)
+		if err != nil {
+			return PrestageResponse{}, err
+		}
+		_, werr := h.store.WriteBlob(reqCtx, blob, f)
+		_ = f.Close()
+		if werr != nil {
+			return PrestageResponse{}, werr
+		}
+		defer func() { _ = h.store.DeleteObject(context.Background(), blob) }()
+		meta.BaseTarBlob = blob
+		b, err := json.Marshal(meta)
+		if err != nil {
+			return PrestageResponse{}, err
+		}
+		body = bytes.NewReader(b)
+		contentType = "application/json"
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, poolURL+"/__internal/prestage", body)
+	if err != nil {
+		return PrestageResponse{}, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	authorizeHostRequest(reqCtx, req, poolURL, targetHostID)
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return PrestageResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return PrestageResponse{}, fmt.Errorf("prestage on %s returned %d: %s", targetHostID, resp.StatusCode, string(errBody))
+	}
+	var out PrestageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return PrestageResponse{}, err
+	}
+	if out.HostID != "" && out.HostID != targetHostID {
+		return out, fmt.Errorf("prestage landed on %s, want %s", out.HostID, targetHostID)
+	}
+	return out, nil
+}
+
+// sendPrestagedDelta is the Phase 2 transfer (caller holds sbxMu): export the delta since Phase 1
+// started and send it directly to the target in a Prestaged hydrate request.
+func (h *HostServer) sendPrestagedDelta(ctx context.Context, targetHostID string, rec SandboxRecord, reason string, migrationStart, freezeStart time.Time) (SandboxRecord, error) {
+	tf, err := os.CreateTemp("", "sbx-delta-*.tar")
+	if err != nil {
+		return SandboxRecord{}, err
+	}
+	deltaPath := tf.Name()
+	_ = tf.Close()
+	defer os.Remove(deltaPath)
+	deleted, err := h.engine.ExportDeltaTar(ctx, rec, migrationStart, deltaPath)
+	if err != nil {
+		return SandboxRecord{}, fmt.Errorf("export delta tar: %w", err)
+	}
+	b, err := os.ReadFile(deltaPath)
+	if err != nil {
+		return SandboxRecord{}, err
+	}
+	req := HydrateRequest{
+		Record:               rec,
+		OverlayTar:           rec.OverlayPath,
+		Reason:               reason,
+		Prestaged:            true,
+		DeletedPaths:         deleted,
+		MigrationStartUnixMs: migrationStart.UnixMilli(),
+		FreezeStartUnixMs:    freezeStart.UnixMilli(),
+	}
+	if len(b) <= maxInlineDeltaBytes || h.store == nil {
+		req.DeltaTar = b
+	} else {
+		blob := fmt.Sprintf("persistence/%s/delta-e%d-%s.tar", rec.SandboxID, rec.Epoch, NewRandomID(""))
+		if _, err := h.store.WriteBlob(ctx, blob, bytes.NewReader(b)); err != nil {
+			return SandboxRecord{}, err
+		}
+		defer func() { _ = h.store.DeleteObject(context.Background(), blob) }()
+		req.DeltaTarBlob = blob
+	}
+	return h.sendHydrateToHost(ctx, targetHostID, req)
+}
+
+// materializeDeltaTar writes a Prestaged hydrate's delta (inline or Store blob) to a temp file.
+func (h *HostServer) materializeDeltaTar(ctx context.Context, req HydrateRequest) (string, int64, func(), error) {
+	tf, err := os.CreateTemp("", "sbx-delta-recv-*.tar")
+	if err != nil {
+		return "", 0, func() {}, err
+	}
+	path := tf.Name()
+	cleanup := func() { _ = os.Remove(path) }
+	var n int64
+	switch {
+	case len(req.DeltaTar) > 0:
+		var w int
+		w, err = tf.Write(req.DeltaTar)
+		n = int64(w)
+	case req.DeltaTarBlob != "" && h.store != nil:
+		rc, ok, rErr := h.store.ReadBlob(ctx, req.DeltaTarBlob)
+		if rErr != nil || !ok {
+			err = fmt.Errorf("read delta blob %s: exists=%v err=%v", req.DeltaTarBlob, ok, rErr)
+		} else {
+			n, err = io.Copy(tf, rc)
+			_ = rc.Close()
+		}
+	}
+	if cErr := tf.Close(); err == nil {
+		err = cErr
+	}
+	if err != nil {
+		cleanup()
+		return "", 0, func() {}, err
+	}
+	if n == 0 {
+		// No modified entries (deletions only, or nothing changed).
+		cleanup()
+		return "", 0, func() {}, nil
+	}
+	return path, n, cleanup, nil
+}
+
+// handleInternalPrestage receives Phase 1 of a Two-Phase Pre-Copy live migration.
+func (h *HostServer) handleInternalPrestage(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	tf, err := os.CreateTemp("", "sbx-prestage-recv-*.tar")
+	if err != nil {
+		writeHostJSON(w, h, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	basePath := tf.Name()
+	defer os.Remove(basePath)
+
+	var meta PrestageRequest
+	var n int64
+	readErr := func() error {
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+			mr, err := r.MultipartReader()
+			if err != nil {
+				return err
+			}
+			for {
+				part, err := mr.NextPart()
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				switch part.FormName() {
+				case "record":
+					err = json.NewDecoder(io.LimitReader(part, 8<<20)).Decode(&meta)
+				case "base_tar":
+					n, err = io.Copy(tf, io.LimitReader(part, maxPrestageTarBytes))
+				}
+				_ = part.Close()
+				if err != nil {
+					return err
+				}
+			}
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, maxInlinePrestageBytes*2)).Decode(&meta); err != nil {
+			return err
+		}
+		if len(meta.BaseTarBytes) > 0 {
+			nw, err := tf.Write(meta.BaseTarBytes)
+			n = int64(nw)
+			meta.BaseTarBytes = nil
+			return err
+		}
+		if meta.BaseTarBlob != "" && h.store != nil {
+			rc, ok, err := h.store.ReadBlob(r.Context(), meta.BaseTarBlob)
+			if err != nil || !ok {
+				return fmt.Errorf("read base tar blob %s: exists=%v err=%v", meta.BaseTarBlob, ok, err)
+			}
+			defer rc.Close()
+			n, err = io.Copy(tf, io.LimitReader(rc, maxPrestageTarBytes))
+			return err
+		}
+		return nil
+	}()
+	if cErr := tf.Close(); readErr == nil {
+		readErr = cErr
+	}
+	if readErr == nil && n == 0 {
+		readErr = errors.New("base tar is required")
+	}
+	if readErr != nil {
+		writeHostJSON(w, h, http.StatusBadRequest, map[string]any{"error": "invalid prestage request: " + readErr.Error()})
+		return
+	}
+
+	out, err := h.prestageSandboxInternal(r.Context(), meta.Record, basePath, meta.SourceHostID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, ErrHostFull):
+			status = http.StatusTooManyRequests
+		case errors.Is(err, ErrHostDraining):
+			status = http.StatusServiceUnavailable
+		case errors.Is(err, ErrInvalidID):
+			status = http.StatusBadRequest
+		case errors.Is(err, errPrestageConflict):
+			status = http.StatusConflict
+		}
+		writeHostJSON(w, h, status, map[string]any{"error": err.Error()})
+		return
+	}
+	out.BaseBytes = n
+	out.PrestageMs = time.Since(start).Milliseconds()
+	writeHostJSON(w, h, http.StatusOK, out)
+}
+
+var errPrestageConflict = errors.New("sandbox is already active on this host")
+
+// prestageSandboxInternal unpacks baseTarPath into a warm (started) container for rec without
+// claiming ownership or counting it as active. Internal databases are quiesced until the delta
+// cutover so the delta can be applied consistently.
+func (h *HostServer) prestageSandboxInternal(ctx context.Context, rec SandboxRecord, baseTarPath, sourceHostID string) (PrestageResponse, error) {
+	if err := ValidateID(rec.SandboxID); err != nil {
+		return PrestageResponse{}, err
+	}
+	sbxMu := h.getSandboxLock(rec.SandboxID)
+	sbxMu.Lock()
+	defer sbxMu.Unlock()
+
+	h.mu.Lock()
+	if h.status == HostDraining {
+		h.mu.Unlock()
+		return PrestageResponse{}, ErrHostDraining
+	}
+	if existing, ok := h.sandboxes[rec.SandboxID]; ok && existing.Status != StatusDeleted {
+		h.mu.Unlock()
+		return PrestageResponse{}, errPrestageConflict
+	}
+	activeCount := 0
+	for _, s := range h.sandboxes {
+		if s.Status == StatusRunning || s.Status == StatusCreating || s.Status == StatusMigrating {
+			activeCount++
+		}
+	}
+	if activeCount >= h.maxDensity {
+		h.mu.Unlock()
+		return PrestageResponse{}, ErrHostFull
+	}
+	_, hadOld := h.prestaged[rec.SandboxID]
+	delete(h.prestaged, rec.SandboxID)
+	hostID := h.hostID
+	h.mu.Unlock()
+
+	if hadOld {
+		_ = h.engine.Stop(ctx, rec.SandboxID)
+	}
+	stageRec := rec
+	stageRec.HostID = hostID
+	stageRec.Status = StatusCreating
+	if err := h.engine.Start(ctx, stageRec, baseTarPath); err != nil {
+		_ = h.engine.Stop(ctx, rec.SandboxID)
+		return PrestageResponse{}, fmt.Errorf("warm start: %w", err)
+	}
+	_ = h.engine.Quiesce(ctx, rec.SandboxID)
+
+	stagedAt := time.Now()
+	h.mu.Lock()
+	h.prestaged[rec.SandboxID] = prestagedSandbox{Record: rec, SourceHostID: sourceHostID, StagedAt: stagedAt}
+	h.recordEventLocked("PRESTAGE", rec.SandboxID, hostID, "",
+		fmt.Sprintf("Pre-staged warm copy of %s from %s (Two-Phase Pre-Copy phase 1)", rec.SandboxID, sourceHostID))
+	h.mu.Unlock()
+	SetInstanceBusyState(true)
+	sandboxID := rec.SandboxID
+	time.AfterFunc(prestageTTL, func() { h.expirePrestaged(sandboxID, stagedAt) })
+	return PrestageResponse{SandboxID: rec.SandboxID, HostID: hostID}, nil
+}
+
+// discardPrestaged drops any warm pre-copy of sandboxID (stopping its container unless the sandbox
+// is active on this host).
+func (h *HostServer) discardPrestaged(ctx context.Context, sandboxID string) {
+	h.expirePrestagedIf(ctx, sandboxID, func(prestagedSandbox) bool { return true })
+}
+
+func (h *HostServer) expirePrestaged(sandboxID string, stagedAt time.Time) {
+	h.expirePrestagedIf(context.Background(), sandboxID, func(p prestagedSandbox) bool { return p.StagedAt.Equal(stagedAt) })
+}
+
+func (h *HostServer) expirePrestagedIf(ctx context.Context, sandboxID string, match func(prestagedSandbox) bool) {
+	sbxMu := h.getSandboxLock(sandboxID)
+	sbxMu.Lock()
+	defer sbxMu.Unlock()
+	h.mu.Lock()
+	p, ok := h.prestaged[sandboxID]
+	if !ok || !match(p) {
+		h.mu.Unlock()
+		return
+	}
+	delete(h.prestaged, sandboxID)
+	_, active := h.sandboxes[sandboxID]
+	h.mu.Unlock()
+	if !active {
+		_ = h.engine.Stop(ctx, sandboxID)
+	}
+}
+
+// checkpointAfterPrestagedCutover exports the full overlay to the Store after a delta cutover so
+// crash recovery has an up-to-date checkpoint (without blocking the cutover itself).
+func (h *HostServer) checkpointAfterPrestagedCutover(sandboxID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), prestageTimeout)
+	defer cancel()
+	h.mu.RLock()
+	rec, ok := h.sandboxes[sandboxID]
+	h.mu.RUnlock()
+	if !ok {
+		return
+	}
+	if err := h.exportSandboxOverlayToStore(ctx, &rec, "post_migrate_checkpoint"); err != nil {
+		h.engine.AppendLog(sandboxID, fmt.Sprintf("[migrate] post-cutover GCS checkpoint failed: %v", err))
+	}
 }

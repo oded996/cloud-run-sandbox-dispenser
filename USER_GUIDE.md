@@ -1,539 +1,356 @@
 # Cloud Run Sandbox Dispenser — User Guide & CLI Reference
 
-This guide provides complete documentation for installing, initializing,
-authenticating, and operating the **Cloud Run Sandbox Dispenser** CLI (`sbx`),
-along with end-to-end cookbook recipes for stateful agent sandboxes, custom
-templates, Copy-on-Write (CoW) cloning, and PostgreSQL 16 persistence.
+**Navigation:** [Overview & Quick Start (README.md)](README.md) ·
+**User Guide & CLI Reference (USER_GUIDE.md)** ·
+[Architecture & Maintainer Guide (ARCHITECTURE.md)](ARCHITECTURE.md) ·
+[Overload Protection (OVERLOAD_PROTECTION.md)](OVERLOAD_PROTECTION.md)
 
-> [!NOTE]
-> For an overview of key capabilities, see
-> **[README.md](README.md)**. For resource overcommit observability,
-> memory-aware admission control, and proactive hot-host live migration, see
-> **[OVERLOAD_PROTECTION.md](OVERLOAD_PROTECTION.md)**. For system
-> architecture, Cloud Run session routing internals, and state consistency
-> design, see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+This guide covers installing, initializing, authenticating, and operating the **Cloud Run Sandbox
+Dispenser** CLI (`sbx` `v1.2.0`), followed by a complete flag-by-flag command reference and
+end-to-end cookbook workflows.
 
-[TOC]
+## Contents
 
-## TL;DR — 30-Second Basic Usage
+- [Command Cheat Sheet](#command-cheat-sheet)
+- [1. Installation, Setup & Core Concepts](#1-installation-setup--core-concepts)
+  - [1.1 Building & Installing the `sbx` CLI](#11-building--installing-the-sbx-cli)
+  - [1.2 Authentication & Local Cache Files (`~/.cache/sbx/`)](#12-authentication--local-cache-files-cachesbx)
+  - [1.3 Core Concepts: Hosts, Persistence & Execution Engines](#13-core-concepts-hosts-persistence--execution-engines)
+  - [1.4 Sandbox IDs (`sbx-<host>-<8hex>`) vs. Sandbox Names](#14-sandbox-ids-sbx-host-8hex-vs-sandbox-names)
+  - [1.5 Global Flags & Environment Variable Overrides](#15-global-flags--environment-variable-overrides)
+- [2. Command-by-Command CLI Reference](#2-command-by-command-cli-reference)
+  - [Setup & Version: `2.1 init` · `2.2 deploy` · `2.3 version`](#21-init--initialize-local-cli-configuration)
+  - [Sandbox Lifecycle: `2.4 create` · `2.5 list` · `2.6 inspect` · `2.7 update` · `2.8 suspend` · `2.9 resume` · `2.10 delete`](#24-create--create-a-new-sandbox)
+  - [Execution, Networking & I/O: `2.11 exec` · `2.12 preview-url` · `2.13 port-forward` · `2.14 ssh` · `2.15 cp` · `2.16 logs`](#211-exec--execute-commands-inside-a-sandbox-buffered-or-sse-stream)
+  - [Cloning, Snapshots & Templates: `2.17 copy` · `2.18 snapshot` · `2.19 template`](#217-copy-alias-fork--clone-a-running-sandbox)
+  - [Live Migration, Fleet Ops & Web Console: `2.20 migrate` · `2.21 hosts` · `2.22 config` · `2.23 stats & metrics` · `2.24 ui`](#220-migrate--two-phase-pre-copy-live-migration-or-host-drain)
+- [3. End-to-End Cookbook Examples](#3-end-to-end-cookbook-examples)
+  - [Example 1: Ephemeral Python Data Science Sandbox & File Transfer](#example-1-ephemeral-python-data-science-sandbox--file-transfer)
+  - [Example 2: Custom Environment Template & Fast Copy-on-Write Cloning](#example-2-custom-environment-template--fast-copy-on-write-cloning)
+  - [Example 3: Persistent PostgreSQL 16 Sandbox Surviving Live Migration & Crash](#example-3-persistent-postgresql-16-sandbox-surviving-live-migration--crash)
+  - [Example 4: Cost Optimization with Idle Auto-Suspend, In-Guest `IDLE` Signaling & Bin-Packing](#example-4-cost-optimization-with-idle-auto-suspend-in-guest-idle-signaling--bin-packing)
+  - [Example 5: High-Throughput Parallel Batch Creation](#example-5-high-throughput-parallel-batch-creation)
 
-```shell
-# Prerequisite: run 'sbx init <CONTROL_PLANE_URL>' or 'sbx init --project=<PROJECT>' once (see Section 1 below)
+---
 
-# 1. Create a persistent Python sandbox (1 vCPU / 1Gi RAM) and capture its unique sandbox_id
-MY_SANDBOX=$(sbx create my-dev-box \
-    --template=python \
-    --cpu=1 \
-    --memory=1Gi \
-    --persistent \
-    --quiet)
-echo "Created sandbox: $MY_SANDBOX"
-# Output: Created sandbox: sbx-host-742e5bf0-a1b2c3d4
-# (Or with JSON output: MY_SANDBOX=$(sbx --json create my-dev-box --template=python --cpu=1 --memory=1Gi --persistent | jq -r '.sandbox_id'))
+## Command Cheat Sheet
 
-# 2. Run a command and copy a local script into the sandbox using $MY_SANDBOX
-sbx exec "$MY_SANDBOX" -- \
-    python3 -c "print('Hello from Cloud Run!')"
-echo "print('Hello from script.py!')" > ./script.py
-sbx cp ./script.py "$MY_SANDBOX":/workspace/script.py
-sbx exec "$MY_SANDBOX" -- python3 /workspace/script.py
+| Category | Command (Aliases) | One-Line Purpose | Section |
+| :--- | :--- | :--- | :--- |
+| **Setup** | `sbx init [URL]` | Discover `sandbox-control-plane` & `sandbox-pool` URLs and cache OIDC auth token. | [§2.1](#21-init--initialize-local-cli-configuration) |
+| **Setup** | `sbx deploy` | Build and deploy the 3 Cloud Run services + GCS bucket and run `sbx init`. | [§2.2](#22-deploy--deploy-or-reconcile-the-dispenser-fleet) |
+| **Setup** | `sbx version` (`-v`) | Check client version, server version, and `min_client_version`. | [§2.3](#23-version--check-client--server-protocol-versions) |
+| **Lifecycle** | `sbx create [NAME]` | Create a sandbox on an open candidate host (or spawn a new `host-<8hex>` clone). | [§2.4](#24-create--create-a-new-sandbox) |
+| **Lifecycle** | `sbx list` (`ls`) | List sandboxes across the fleet (`--name`, `--prefix`, `--status`). | [§2.5](#25-list-alias-ls--list-sandboxes-across-the-fleet) |
+| **Lifecycle** | `sbx inspect ID` (`describe`) | Fetch the full `SandboxRecord` JSON (including resource and migration telemetry). | [§2.6](#26-inspect-alias-describe--inspect-sandbox-state--metrics) |
+| **Lifecycle** | `sbx update ID` | Resize CPU/RAM or update idle timeout, egress policy, env, and metadata in place. | [§2.7](#27-update--update-cpu-memory-idle-timeout-egress-env--metadata-in-place) |
+| **Lifecycle** | `sbx suspend ID` / `sbx stop ID` | Export writable overlay to GCS, stop container (`SUSPENDED` / `STOPPED`), and free host slot. | [§2.8](#28-suspend--stop--checkpoint-overlay-to-gcs-and-release-host-slot) |
+| **Lifecycle** | `sbx resume ID` / `sbx start ID` | Hydrate a `SUSPENDED` or `STOPPED` sandbox onto a warm host and restart background jobs. | [§2.9](#29-resume--start--hydrate-a-suspended-or-stopped-sandbox) |
+| **Lifecycle** | `sbx delete ID...` (`rm`) | Permanently delete one or more sandboxes and their persisted GCS overlays. | [§2.10](#210-delete-alias-rm--delete-one-or-more-sandboxes) |
+| **Exec & I/O** | `sbx exec ID -- CMD` | Run foreground, real-time SSE streaming (`-s`), or background (`-d`) commands. | [§2.11](#211-exec--execute-commands-inside-a-sandbox-buffered-or-sse-stream) |
+| **Networking** | `sbx preview-url ID` (`preview`) | Print the IAM-gated HTTP/WebSocket preview URL (`/proxy/<id>/<port>/<path>`). | [§2.12](#212-preview-url-alias-preview--iam-authenticated-httpwebsocket-preview-urls) |
+| **Networking** | `sbx port-forward ID` (`forward`) | Tunnel a local TCP port to a remote port inside a sandbox (with Wake-on-Connect). | [§2.13](#213-port-forward-alias-forward--local-tcp-port-tunneling) |
+| **Exec & I/O** | `sbx ssh ID` | Open a line-oriented interactive shell REPL inside `/workspace`. | [§2.14](#214-ssh--open-an-interactive-line-repl-shell) |
+| **Exec & I/O** | `sbx cp SRC DST` | Upload or download files between the local machine and `<ID>:/remote/path`. | [§2.15](#215-cp--copy-files-between-local-machine-and-sandbox) |
+| **Exec & I/O** | `sbx logs ID` | View sandbox command output and lifecycle events (`--tail=N`). | [§2.16](#216-logs--fetch-stdout-stderr-and-lifecycle-logs) |
+| **State** | `sbx copy SRC NAME` (`fork`) | Clone a running sandbox via same-host CoW fork or cross-host snapshot. | [§2.17](#217-copy-alias-fork--clone-a-running-sandbox) |
+| **State** | `sbx snapshot create\|list\|delete` | Capture, list, or delete (`rm`) point-in-time filesystem snapshots. | [§2.18](#218-snapshot-create-list-delete--rm--point-in-time-filesystem-snapshots) |
+| **State** | `sbx template list\|create\|delete` | Manage built-in and custom snapshot-backed templates (alias: `templates`). | [§2.19](#219-template-list-create--add-delete--rm--built-in--custom-templates) |
+| **Fleet Ops** | `sbx migrate ID` | Live-migrate a sandbox via Two-Phase Pre-Copy (`--to-host`) or drain `--host`. | [§2.20](#220-migrate--two-phase-pre-copy-live-migration-or-host-drain) |
+| **Fleet Ops** | `sbx hosts list\|drain\|compact` | Inspect host sessions, drain a host, compact sparse hosts, or `simulate-crash`. | [§2.21](#221-hosts-list-drain-compact-simulate-crash--manage-host-sessions) |
+| **Fleet Ops** | `sbx config get\|set` | View or dynamically tune fleet density, host CPU/RAM, and overload thresholds. | [§2.22](#222-config-get-set--view-and-tune-fleet-wide-settings) |
+| **Fleet Ops** | `sbx stats` / `sbx metrics` | View fleet SLA summary, CPU/RAM overcommit ratios, `--history`, and sizing advice. | [§2.23](#223-stats--metrics--fleet-sla-and-overcommit-observability) |
+| **Console** | `sbx ui` | Launch the Web Console BFF locally on `http://127.0.0.1:8080`. | [§2.24](#224-ui--web-console-ui-sandbox-ui--sbx-ui) |
 
-# 3. List running sandboxes (multiple sandboxes can share the same name)
-sbx list
-# Output:
-# SANDBOX_ID                   NAME         STATUS    TEMPLATE  HOST_ID         EPOCH  PERSISTENT  MIGRATIONS  RECOVERIES
-# sbx-host-742e5bf0-a1b2c3d4   my-dev-box   RUNNING   python    host-742e5bf0   1      true        0           0
+---
 
-# 4. Dynamically resize CPU/RAM, or suspend and resume the sandbox (preserving /workspace and releasing the host slot)
-sbx update "$MY_SANDBOX" --cpu=2 --memory=2Gi
-sbx suspend "$MY_SANDBOX"
-sbx resume "$MY_SANDBOX"
+## 1. Installation, Setup & Core Concepts
 
-# 5. Delete the sandbox when done
-sbx delete "$MY_SANDBOX"
-```
+### 1.1 Building & Installing the `sbx` CLI
 
------
-
-## 1\. Installation, Setup & Authentication
-
-### Building the `sbx` CLI
-
-Build `sbx` using standard Go tooling (or `make build`) and alias it in your
-shell:
+Build `sbx` from source using Go 1.23+ (or `make install`):
 
 ```shell
 git clone https://github.com/oded996/cloud-run-sandbox-dispenser.git
 cd cloud-run-sandbox-dispenser
-go build -trimpath -ldflags="-s -w" -o sbx .
-alias sbx="$(pwd)/sbx"
-
-# Or install directly via Go (works in Google Cloud Shell & local shells, including 'sbx deploy'):
-go install github.com/oded996/cloud-run-sandbox-dispenser@latest
-ln -sf "$(go env GOPATH | cut -d: -f1)/bin/cloud-run-sandbox-dispenser" "$(go env GOPATH | cut -d: -f1)/bin/sbx"
-export PATH="$(go env GOPATH | cut -d: -f1)/bin:${PATH}"
+make install   # builds ./sbx and installs into $GOBIN or $(go env GOPATH)/bin
+export PATH="${GOBIN:-$(go env GOPATH | cut -d: -f1)/bin}:${PATH}"
 ```
 
-### Zero-Environment-Variable Setup (`sbx init` or `sbx deploy`)
+Or install directly via `go install`:
 
-You do **not** need to manually set environment variables or fetch
-authentication tokens. Choose either **Option A** (connecting to an existing
-deployment) or **Option B** (deploying a new fleet):
+```shell
+go install github.com/oded996/cloud-run-sandbox-dispenser@latest
+export PATH="${GOBIN:-$(go env GOPATH | cut -d: -f1)/bin}:${PATH}"
+cloud-run-sandbox-dispenser version   # creates the 'sbx' symlink in GOBIN on first run
+```
 
-#### Option A — Connect to an Existing Dispenser (`sbx init`)
+Once installed, either connect to an existing deployment with `sbx init`
+([§2.1](#21-init--initialize-local-cli-configuration)) or deploy a new fleet in your GCP project
+with `sbx deploy` ([§2.2](#22-deploy--deploy-or-reconcile-the-dispenser-fleet)).
 
-Run `sbx init` with the `sandbox-control-plane` URL (or pass `--project` and
-`--region` so `sbx init` looks up the service URL via `gcloud`):
+### 1.2 Authentication & Local Cache Files (`~/.cache/sbx/`)
+
+All backend services (`sandbox-pool` and `sandbox-control-plane`) enforce Cloud Run IAM
+authentication (`roles/run.invoker`). You do not need to manually fetch or export tokens:
+
+* **Automatic Token Acquisition**: When communicating with a Cloud Run `https://*.run.app`
+  endpoint, `sbx` invokes `gcloud auth print-identity-token` (and `gcloud auth print-access-token`
+  for GCS operations, or queries the GCE/Cloud Run metadata server when running inside GCP).
+* **45-Minute Disk Cache**: Tokens are cached in `~/.cache/sbx/token_cache.json` (mode `0600`,
+  45-minute TTL) and refreshed automatically before expiry, eliminating per-command `gcloud`
+  subprocess latency.
+* **Direct `curl` Inspection**: To call HTTP endpoints or preview URLs directly with `curl`, pass
+  `Authorization: Bearer $(gcloud auth print-identity-token)`.
+
+| Cache File (`~/.cache/sbx/`) | Purpose |
+| :--- | :--- |
+| `endpoints.json` | Persists `control_plane_url` and `pool_service_url` discovered by `sbx init` or `sbx deploy`. |
+| `token_cache.json` | Caches OIDC identity tokens and OAuth2 access tokens (mode `0600`, 45m TTL). |
+| `candidates.json` | Cached `GET /v1/candidates` response (`candidates[]`, `pool_service_url`, `max_density`). Refreshed when local free slots reach `0` or when `refresh_interval_sec` expires (`15s` normally, `5s` when fleet free slots `<= 5`, `2s` when `<= 2`). |
+| `routes.json` | Maps `<sandbox_id> -> <host_id>` and `<name> -> <sandbox_id>`. Updated on `create`/`copy`/`migrate` and self-healed on `HTTP 409 Conflict`. |
+
+### 1.3 Core Concepts: Hosts, Persistence & Execution Engines
+
+* **Host Session (`host-<8hex>`)**: A single Cloud Run session-affinity instance in `sandbox-pool`
+  (default `4` vCPU / `8Gi` RAM, packing up to `max_density=10` sandboxes). When a host has `0`
+  active sandboxes, it releases its `/__internal/hold-busy` keepalive and marks
+  `/sys/class/instance/state` as `idle` so Cloud Run scales it down to zero.
+* **Persistent (`--persistent`) vs. Ephemeral Sandboxes**:
+  * **Persistent (`--persistent`)**: Syncs the writable overlay (`/workspace`, `/persistent`, and
+    PostgreSQL `/pgdata/data`) to `persistence/<sandbox_id>/overlay.tar` in GCS in the background
+    (dirty sandboxes every `3s`, all persistent sandboxes every `10s`) and before every `suspend` or
+    `migrate`. Persistent sandboxes survive suspend/resume cycles, live migrations, revision
+    rollouts, and host crashes. Sandboxes created with `--template=postgres` or with an idle
+    timeout `> 0` automatically enable `persistent=true`.
+  * **Ephemeral (default when `--persistent` is omitted)**: Fast scratch environments for
+    short-lived tasks. Ephemeral sandboxes support in-place `exec`, `cp`, `migrate`, and explicit
+    `suspend`/`resume`, but skip periodic background GCS syncs.
+* **Execution Engine (`cloudrun` vs. `local`)**:
+  * **`cloudrun`**: When the Cloud Run Sandbox Runtime (`/usr/local/gcp/bin/sandbox` and
+    `/run/gcp/sandbox/sandbox.sock`) is available on `sandbox-pool`, each sandbox runs in an
+    isolated micro-container with private namespaces, cgroup-enforced `--cpu` and `--memory`
+    limits, and runtime-enforced `--no-allow-egress`.
+  * **`local`**: When the Cloud Run Sandbox Runtime socket is absent (or `SBX_FORCE_LOCAL_ENGINE=1`
+    is set), `hostd` falls back to `LocalProcessEngine` (`engine_type: "local"`), giving each
+    sandbox a private `chmod 0700` directory tree inside the shared `hostd` container.
+
+> [!WARNING]
+> In `engine_type: "local"` mode, sandboxes share the container kernel namespaces, network stack,
+> and service-account identity with `hostd`, and `--no-allow-egress` is enforced only on a
+> best-effort basis (via dead-end proxy env vars, `curl`/`wget`/`nc` PATH shims, and a Python
+> `sitecustomize.py` socket guard). Always use `engine_type: "cloudrun"` for untrusted workloads.
+
+### 1.4 Sandbox IDs (`sbx-<host>-<8hex>`) vs. Sandbox Names
+
+* **Sandbox Name (`name`)**: An optional human-readable label passed via `sbx create <NAME>`
+  (matching `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`). Multiple sandboxes across the fleet can share the
+  same `name`.
+* **Sandbox ID (`sandbox_id`)**: A globally unique identifier minted by the creating host in the
+  form `sbx-<host_id>-<8hex>` (for example, `sbx-host-742e5bf0-a1b2c3d4`).
+  1. **Lock-Free Parallel Creation**: Concurrent workers can all run `sbx create worker -q` without
+     naming collisions.
+  2. **Zero-Lookup Direct Routing**: Because `<host_id>` is embedded in `sandbox_id`, `sbx` routes
+     directly to the owning host without querying `sandbox-control-plane` (and self-heals
+     `routes.json` via `HTTP 409` if the sandbox live-migrates).
+  3. **Ambiguous Name Protection**: If exactly **one** active sandbox matches `<NAME>`, you can
+     pass `<NAME>` to any command (`sbx exec my-box ...`). If **two or more** active sandboxes
+     share `<NAME>`, `GET /v1/sandboxes/<NAME>` rejects the lookup with `HTTP 409 Conflict` and
+     JSON body
+     `{"error": "ambiguous sandbox name \"worker\" matches 2 sandboxes (sbx-..., sbx-...); please specify the exact sandbox_id"}`
+     (`hostd` also includes `"error_code": "ambiguous_sandbox_name"`) so you never mutate or delete
+     the wrong sandbox.
+
+### 1.5 Global Flags & Environment Variable Overrides
+
+Global flags may be placed before any subcommand:
+
+| Global Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--control-plane-url=<URL>` | `~/.cache/sbx/endpoints.json` | Override the `sandbox-control-plane` URL for a single command. |
+| `--pool-url=<URL>` | `~/.cache/sbx/endpoints.json` | Override the `sandbox-pool` URL for a single command. |
+| `--cache-dir=<DIR>` (alias `--config-dir`) | `~/.cache/sbx` | Directory for endpoint, candidate, route, and OIDC token caches. |
+| `--json` | `false` | Emit machine-readable JSON output instead of tables/text. |
+| `--help`, `-h` | `false` | Print global or subcommand usage help. |
+
+Optional environment variables for stateless CI workers or multi-tenant test harnesses:
+
+| Environment Variable | Purpose |
+| :--- | :--- |
+| `SBX_CONTROL_PLANE_URL` | Overrides `sandbox-control-plane` URL when `--control-plane-url` is not passed. |
+| `SBX_POOL_URL` | Overrides `sandbox-pool` URL when `--pool-url` is not passed. |
+| `SBX_CACHE_DIR` / `SBX_CONFIG_DIR` | Overrides the local cache directory (`~/.cache/sbx`). |
+| `SBX_ID_TOKEN` | Explicit OIDC bearer token override for `https://` Cloud Run requests. |
+
+---
+
+## 2. Command-by-Command CLI Reference
+
+### 2.1 `init` — Initialize Local CLI Configuration
+
+Connects to an existing `sandbox-control-plane` service (by explicit URL or by auto-discovering it
+via `gcloud` from `--project` and `--region`), caches an OIDC token in `token_cache.json`, fetches
+`/v1/candidates`, and writes `endpoints.json` and `candidates.json`.
+
+#### Synopsis & Flags
+
+```shell
+sbx init [CONTROL_PLANE_URL] [--url=<URL>] [--project=<PROJECT_ID>] [--region=<REGION>] [--json]
+```
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--url` | `string` | positional `[CONTROL_PLANE_URL]` | HTTPS URL of the `sandbox-control-plane` Cloud Run service. |
+| `--project` | `string` | `""` (active `gcloud` project) | GCP project ID used to discover `sandbox-control-plane` when no URL is given. |
+| `--region` | `string` | `us-west1` | Cloud Run region used when discovering `sandbox-control-plane` by project. |
+
+* When `--project` is omitted, `sbx init` checks `$GOOGLE_CLOUD_PROJECT`, `$GCLOUD_PROJECT`,
+  `$DEVSHELL_PROJECT_ID`, `$CLOUDSDK_CORE_PROJECT`, and `gcloud config get-value project`.
+
+#### Example
 
 ```shell
 sbx init https://sandbox-control-plane-xxxxx-uw.a.run.app
 # Or discover by project and region:
-# sbx init --project=my-gcp-project --region=us-west1
-```
-
-`sbx init` automatically:
-
-1.  Acquires and caches your Google Cloud OIDC identity token in
-    `~/.cache/sbx/token_cache.json`.
-2.  Queries `/v1/candidates` on the control plane to discover the `sandbox-pool`
-    URL, `max_density` (default `10`), host size (`4` vCPU / `8Gi` RAM), and
-    initial warm host candidates.
-3.  Saves the discovered endpoints in `~/.cache/sbx/endpoints.json` and
-    candidate list in `~/.cache/sbx/candidates.json`.
-
-#### Option B — Deploy a New Dispenser from Scratch (`sbx deploy`)
-
-Each `sandbox-pool` host clone defaults to **4 vCPU and 8Gi RAM** (`--host-cpu=4
---host-memory=8Gi`), which pairs with the default bin-packing density
-(`max_density=10`) to comfortably host up to 10 sandboxes per warm clone:
-
-```shell
-sbx deploy \
-    --project=my-gcp-project \
-    --region=us-west1 \
-    --host-cpu=4 \
-    --host-memory=8Gi
-```
-
-`sbx deploy` builds and deploys the Cloud Run services (`sandbox-control-plane`
-and `sandbox-pool`), configures IAM invoker bindings, and **automatically runs
-`sbx init`** at the end so your local `~/.cache/sbx/` directory is immediately
-configured with the control plane URL, pool URL, and cached auth token.
-
-You can also modify the host vCPU/RAM allocation at any time after deployment
-using `sbx config set`:
-
-```shell
-sbx config set --host-cpu=8 --host-memory=16Gi
-```
-
-### How Authentication & Token Caching Works
-
-All backend services (`sandbox-pool` and `sandbox-control-plane`) enforce Cloud
-Run IAM authentication. **You never need to manually fetch or export tokens**:
-
-*   **Automatic Acquisition & Caching**: When `sbx init`, `sbx deploy`, or any
-    `sbx` command communicates with a Cloud Run `https://*.run.app` endpoint,
-    `sbx` automatically invokes the Google Cloud CLI (`gcloud auth
-    print-identity-token` for Cloud Run IAM requests and `gcloud auth
-    print-access-token` for GCS operations, or queries the GCE/Cloud Run
-    metadata server when running inside GCP).
-
-*   **Zero Per-Command Overhead**: The acquired token is cached on disk in
-    `~/.cache/sbx/token_cache.json` (mode `0600`, 45-minute TTL) and refreshed
-    automatically before expiration, so subsequent `sbx` commands run in
-    milliseconds with zero `gcloud` subprocess overhead.
-
-*   **Manual Inspection / Direct `curl` Access**: If you ever want to inspect
-    your OIDC identity token or call the REST endpoints directly with `curl`,
-    you can run:
-
-    ```shell
-    gcloud auth print-identity-token
-    ```
-
-### Local Cache Files in `~/.cache/sbx/`
-
-| File               | Purpose                                                                                                                                                                               |
-| :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `endpoints.json`   | Persists `control_plane_url` and `pool_service_url` configured by `sbx init` or `sbx deploy`.                                                                                         |
-| `token_cache.json` | Caches OIDC identity tokens and OAuth2 access tokens across CLI runs (mode `0600`).                                                                                                   |
-| `candidates.json`  | Cached response from `GET /v1/candidates` (`candidates[]`, `pool_service_url`, `max_density`, `fetched_at`). Refreshed adaptively when expired or when local free slots drop to zero. |
-| `routes.json`      | Maps `<sandbox_id> -> <host_session_id>` and `<name> -> <sandbox_id>`. Automatically updated on `create`, `copy`, `migrate`, and self-healed if a sandbox migrates to a new host.     |
-
-### Core Concepts: Hosts, Persistence & Execution Engines
-
-*   **Host (`host-<id>`)**: A single Cloud Run session instance in the
-    `sandbox-pool` service. Each host defaults to **4 vCPU and 8Gi RAM**
-    (`--host-cpu=4 --host-memory=8Gi`) and bin-packs up to `max_density`
-    (default `10`) isolated sandboxes concurrently. When a host has `0` active
-    sandboxes, it marks itself `idle` so Cloud Run scales it down to zero.
-*   **Persistent (`--persistent`) vs. Ephemeral Sandboxes**:
-    *   **Persistent (`--persistent`)**: Continuously backs up the sandbox's
-        writable filesystem (`/workspace`, `/persistent`, and PostgreSQL
-        `/pgdata/data`) to Cloud Storage
-        (`persistence/<sandbox_id>/overlay.tar`) every `periodic_sync_sec`
-        (default `10s`) and before every `suspend` or `migrate`. Persistent
-        sandboxes survive suspend/resume cycles, live migrations, revision
-        rollouts, and unexpected host crashes.
-    *   **Ephemeral (default when `--persistent` is omitted)**: Fast scratch
-        environments for short-lived tasks. Ephemeral sandboxes still support
-        in-place `exec`/`cp` and explicit `suspend`/`resume`, but do not run
-        periodic background GCS syncs.
-*   **Execution Engine (`cloudrun` vs. `local`)**:
-    *   **`cloudrun`**: On Cloud Run environments with the Cloud Run Sandbox Runtime
-        micro-container runtime socket (`/run/gcp/sandbox/sandbox.sock`), each sandbox
-        runs inside a dedicated Cloud Run Sandbox Runtime container with full
-        container/filesystem namespace isolation and hardware-enforced cgroup
-        `--cpu` and `--memory` limits.
-    *   **`local`**: On standard Cloud Run projects where the Cloud Run Sandbox Runtime socket is
-        not present, `hostd` automatically operates in `engine_type: "local"`
-        process-sandbox mode. Each sandbox is given its own private working
-        directory tree (`chmod 0700` containing `/workspace`, `/persistent`,
-        `/pgdata/data`) inside the shared host container without separate kernel
-        namespaces, sharing the host image's pre-installed userland (`python3`,
-        `node`, `psql`, `git`, `curl`) while `--cpu` and `--memory` are tracked
-        as scheduling metadata on the `SandboxRecord`.
-
-### Understanding Sandbox IDs vs. Sandbox Names
-
-To allow fast, parallel sandbox creation across the fleet without central naming
-collisions:
-
-*   **Sandbox Name (`name`)**: An optional human-friendly label passed via `sbx
-    create <NAME>` or `sbx create --name=<NAME>` (must match
-    `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`). If omitted, the sandbox's `name`
-    defaults to its generated `sandbox_id`. **Multiple sandboxes across the
-    fleet can share the same `name`**.
-*   **Sandbox ID (`sandbox_id`)**: A globally unique identifier minted by the
-    creating host session in the format: `sbx-<host_id>-<8_hex_chars>` (for
-    example, `sbx-host-742e5bf0-a1b2c3d4`).
-*   **Why `sandbox_id` Is Structured This Way**:
-    1.  **Zero-Contention Parallel Creation**: Ten concurrent workers can all
-        run `sbx create worker` simultaneously; each receives its own unique
-        `sandbox_id` (`sbx-host-01-11223344`, `sbx-host-02-55667788`, etc.)
-        without overwriting each other.
-    2.  **Direct Host Routing**: Because the initial `<host_id>` is embedded in
-        the `sandbox_id`, `sbx` can route commands directly to the host running
-        your sandbox (and automatically update its local route cache if the
-        sandbox live-migrates to another host; see
-        **[ARCHITECTURE.md](ARCHITECTURE.md)** for protocol details).
-    3.  **Capturing `$MY_SANDBOX`**: Because multiple sandboxes can share the
-        same `name`, the recommended practice is to capture the unique
-        `sandbox_id` on creation using `--quiet` (`-q` / `--id-only`) or
-        `--json`: `MY_SANDBOX=$(sbx create my-dev-box --template=python
-        --quiet)` and pass `"$MY_SANDBOX"` to subsequent commands.
-    4.  **Ambiguous Name Protection**: If only **one** active sandbox has a
-        given `name`, you can pass either its `name` or its `sandbox_id` to `sbx
-        exec`, `inspect`, `suspend`, `delete`, etc. If **two or more** active
-        sandboxes share the same `name`, passing the ambiguous `name` is safely
-        rejected with an error listing all matching `sandbox_id`s (`ambiguous
-        sandbox name "worker" matches 2 sandboxes: sbx-..., sbx-...; specify the
-        exact sandbox_id`) so you never accidentally mutate or delete the wrong
-        sandbox.
-
-### Global Flags
-
-Global flags may be passed before any subcommand:
-
-| Flag                        | Description                                                            | Default                                           |
-| :-------------------------- | :--------------------------------------------------------------------- | :------------------------------------------------ |
-| `--control-plane-url=<URL>` | Override the `sandbox-control-plane` URL for a single invocation.      | Configured in `~/.cache/sbx/endpoints.json`       |
-| `--pool-url=<URL>`          | Override the `sandbox-pool` URL for a single invocation.               | Auto-discovered via `sbx init` / `/v1/candidates` |
-| `--cache-dir=<DIR>`         | Directory for local route, candidate, endpoint, and OIDC token caches. | `~/.cache/sbx`                                    |
-| `--config-dir=<DIR>`        | Alias for `--cache-dir`.                                               | `~/.cache/sbx`                                    |
-| `--json`                    | Emit structured JSON output instead of human-readable tables/messages. | `false`                                           |
-| `--help`, `-h`              | Display global or subcommand usage information.                        | `false`                                           |
-
-### Advanced: Optional Environment Variable Overrides (CI / Multi-Tenant Testing)
-
-Normal users never need to set environment variables because `sbx init` and `sbx
-deploy` configure `~/.cache/sbx/` automatically. For stateless CI runners or
-isolated multi-tenant test workers, the following optional overrides are
-supported:
-
-| Environment Variable    | Purpose                                                                                                  |
-| :---------------------- | :------------------------------------------------------------------------------------------------------- |
-| `SBX_CONTROL_PLANE_URL` | Overrides the `sandbox-control-plane` service URL when `--control-plane-url` is not specified.           |
-| `SBX_POOL_URL`          | Overrides the `sandbox-pool` service URL when `--pool-url` is not specified.                             |
-| `SBX_CACHE_DIR`         | Overrides the cache directory (`~/.cache/sbx`) for isolated test workers.                                |
-| `SBX_ID_TOKEN`          | Explicit OIDC Identity Token override for `Authorization: Bearer <token>` on `https://` Cloud Run calls. |
-
------
-
-## 2\. Complete Command-by-Command CLI Reference
-
-### 2.1 `init` — Initialize Local CLI Configuration from Control Plane
-
-Connects to an existing `sandbox-control-plane` service (either by explicit URL
-or by discovering it via `--project` and `--region`), automatically fetches and
-caches your Google Cloud OIDC identity token, discovers the `sandbox-pool` URL
-and initial candidate host list from `/v1/candidates`, and persists the
-configuration in `~/.cache/sbx/`.
-
-#### Synopsis
-
-```shell
-sbx init [CONTROL_PLANE_URL] \
-    [--url=<CONTROL_PLANE_URL>] \
-    [--project=<PROJECT_ID>] \
-    [--region=<REGION>] \
-    [--json]
-```
-
-#### Flags
-
-| Flag        | Type     | Default                          | Description                                                                          |
-| :---------- | :------- | :------------------------------- | :----------------------------------------------------------------------------------- |
-| `--url`     | `string` | positional `[CONTROL_PLANE_URL]` | HTTPS URL of the `sandbox-control-plane` Cloud Run service.                          |
-| `--project` | `string` | `my-gcp-project`                 | GCP project ID used to auto-discover `sandbox-control-plane` when no URL is given.   |
-| `--region`  | `string` | `us-west1`                       | Cloud Run region used to auto-discover `sandbox-control-plane` when no URL is given. |
-
-#### Examples
-
-```shell
-# Initialize directly from a control plane URL
-sbx init https://sandbox-control-plane-xxxxx-uw.a.run.app
-# Output:
-# Initialized sbx configuration in ~/.cache/sbx
-#   Control Plane URL: https://sandbox-control-plane-xxxxx-uw.a.run.app
-#   Pool Service URL:  https://sandbox-pool-xxxxx-uw.a.run.app
-#   Host Size:         4 vCPU / 8Gi RAM
-#   Max Density:       10 sandboxes/host
-#   Auth Token:        Cached via gcloud (token_cache.json)
-
-# Or auto-discover the control plane URL from your GCP project & region
 sbx init --project=my-gcp-project --region=us-west1
 ```
 
------
+---
 
-### 2.2 `deploy` — Deploy or Update the Dispenser Fleet on Cloud Run
+### 2.2 `deploy` — Deploy or Reconcile the Dispenser Fleet
 
-Builds the container image via Cloud Build (when `deploy.sh` is present in the
-working directory), deploys `sandbox-control-plane`, `sandbox-pool`, and
-`sandbox-ui` to Cloud Run (configuring each `sandbox-pool` host clone with
-`--host-cpu` and `--host-memory`), and **automatically runs `sbx init`** so your
-local CLI is immediately ready to use.
+Builds the container image via Cloud Build (when `deploy.sh` is present in the working directory),
+deploys `sandbox-control-plane`, `sandbox-pool`, and `sandbox-ui` to Cloud Run, seeds Cloud Run IAM
+and Cloud IAP bindings for the deploying user, and runs `sbx init` automatically. Once
+`sandbox-control-plane` is reachable, `sbx deploy` can also reconcile fleet sizing from any
+directory via `POST /v1/deploy`.
 
-Once `sandbox-control-plane` is reachable, `sbx deploy` delegates `sandbox-pool`
-and `sandbox-ui` rollout, mutual URL wiring (`CONTROL_PLANE_URL`,
-`POOL_SERVICE_URL`), and fleet configuration reconciliation to `POST /v1/deploy`
-on the control plane—allowing you to reconcile or resize the fleet from any
-directory once initialized.
-
-#### Prerequisites for a Brand-New GCP Project
-
-Before running `sbx deploy` in a new GCP project for the first time, ensure you
-are authenticated with `gcloud` and enable the required Google Cloud APIs:
+#### Synopsis & Flags
 
 ```shell
-gcloud auth login
-gcloud services enable \
-    run.googleapis.com \
-    cloudbuild.googleapis.com \
-    artifactregistry.googleapis.com \
-    storage.googleapis.com \
-    --project=<PROJECT_ID>
+sbx deploy [--project=<PROJECT_ID>] [--region=<REGION>] [--bucket=<GCS_BUCKET>] \
+    [--host-cpu=<VCPU>] [--host-memory=<MEMORY>] [--max-density=<N>]
 ```
 
-#### Synopsis
-
-```shell
-sbx deploy \
-    [--project=<PROJECT_ID>] \
-    [--region=<REGION>] \
-    [--bucket=<GCS_BUCKET>] \
-    [--host-cpu=<VCPU>] \
-    [--host-memory=<MEMORY>] \
-    [--max-density=<N>]
-```
-
-#### Flags
-
-| Flag            | Type     | Default                                                               | Description                                                                                                           |
-| :-------------- | :------- | :-------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------- |
-| `--project`     | `string` | `my-gcp-project`                                                      | Google Cloud project ID.                                                                                              |
-| `--region`      | `string` | `us-west1`                                                            | Cloud Run deployment region.                                                                                          |
-| `--bucket`      | `string` | `<PROJECT_ID>-sandbox-dispenser` (`my-gcp-project-sandbox-dispenser`) | GCS bucket name for state files and overlay persistence (created automatically by `sbx deploy` if it does not exist). |
-| `--host-cpu`    | `string` | `4`                                                                   | vCPU allocation for each `sandbox-pool` host session clone (for example, `2`, `4`, `8`).                              |
-| `--host-memory` | `string` | `8Gi`                                                                 | Memory allocation for each `sandbox-pool` host session clone (for example, `4Gi`, `8Gi`, `16Gi`).                     |
-| `--max-density` | `int`    | `10`                                                                  | Maximum concurrent sandboxes packed onto a single `HostSession` clone.                                                |
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--project` | `string` | active `gcloud` project | GCP project ID (reads `$GOOGLE_CLOUD_PROJECT` / `gcloud config`, fallback `my-gcp-project`). |
+| `--region` | `string` | `us-west1` | Cloud Run deployment region. |
+| `--bucket` | `string` | `<PROJECT_ID>-sandbox-dispenser` | GCS bucket for state and overlays (created automatically if missing). |
+| `--host-cpu` | `string` | `4` | vCPU allocation per `sandbox-pool` host clone (`2`, `4`, `8`). |
+| `--host-memory` | `string` | `8Gi` | Memory allocation per `sandbox-pool` host clone (`4Gi`, `8Gi`, `16Gi`, `32Gi`). |
+| `--max-density` | `int` | `10` | Maximum concurrent sandboxes packed onto a single host clone. |
 
 #### Example
 
 ```shell
-sbx deploy \
-    --project=my-gcp-project \
-    --region=us-west1 \
-    --bucket=my-gcp-project-sandbox-dispenser \
-    --host-cpu=4 \
-    --host-memory=8Gi
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+    artifactregistry.googleapis.com storage.googleapis.com iap.googleapis.com \
+    --project=my-gcp-project
+
+sbx deploy --project=my-gcp-project --region=us-west1 --host-cpu=4 --host-memory=8Gi
 ```
 
------
+---
 
-### 2.3 `create` — Create a New Sandbox
+### 2.3 `version` — Check Client & Server Protocol Versions
 
-Creates a new sandbox directly on an available candidate `HostSession` (or
-autonomously spawns a new `host-<random>` session clone if all known candidates
-are full).
+*(Aliases: `--version`, `-v`)*
 
-#### Synopsis
+Prints the local `sbx` client version (`1.2.0`) and, when initialized, queries `GET /v1/config` to
+report `server_version` and `min_client_version`.
 
 ```shell
-sbx create [NAME] \
-    [--name=<NAME>] \
-    [--template=ubuntu|python|node|postgres|<CUSTOM>] \
-    [--persistent] \
-    [--cpu=<CPU>] \
-    [--memory=<MEMORY>] \
-    [--allow-egress=true|false | --no-allow-egress] \
-    [--from-snapshot=<SNAPSHOT_ID>] \
-    [--host=<HOST_ID>] \
-    [--pinned] \
-    [--idle-timeout=<SECONDS> | --auto-suspend=<SECONDS> | --no-auto-suspend] \
-    [--env=<KEY=VAL>] \
-    [--metadata=<KEY=VAL>] \
-    [--force] \
-    [--quiet | -q | --id-only] \
-    [--json]
+sbx version
+# Output: sbx client v1.2.0 (server v1.2.0, min_client_version=1.0.0)
 ```
 
-#### Flags
+---
 
-| Flag                         | Type      | Default             | Description                                                                                                                                                                                                               |
-| :--------------------------- | :-------- | :------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--name`                     | `string`  | positional `[NAME]` | Human-readable sandbox name. Host generates a unique `sandbox_id` (`sbx-<host_id>-<8hex>`).                                                                                                                               |
-| `--template`                 | `string`  | `ubuntu`            | Template to boot: built-in (`ubuntu`, `python`, `node`, `postgres`) or custom registered template name.                                                                                                                   |
-| `--persistent`               | `bool`    | `false`             | Persist writable `rootfs-upper` overlay (`/workspace`, `/persistent`, `/pgdata/data`) to GCS across migrations, suspends, and crashes.                                                                                    |
-| `--cpu`                      | `string`  | `1`                 | CPU allocation (positive number like `1`, `2`, `0.5`, or millicores like `500m`).                                                                                                                                         |
-| `--memory`                   | `string`  | `1Gi`               | Memory allocation (for example, `512Mi`, `1Gi`, `2Gi`).                                                                                                                                                                   |
-| `--allow-egress`             | `bool`    | `true`              | Allow outbound internet egress from the sandbox (enforced via Cloud Run `sandbox do --allow-egress` / Cloud Run Sandbox Runtime `--allow-egress` and local socket/proxy guards).                                                           |
-| `--no-allow-egress`          | `bool`    | `false`             | Shorthand for `--allow-egress=false` to block outbound internet access from the sandbox while permitting loopback (`127.0.0.1`/`localhost`).                                                                              |
-| `--from-snapshot`            | `string`  | `""`                | Hydrate initial filesystem state from an existing snapshot ID.                                                                                                                                                            |
-| `--host`                     | `string`  | `""`                | Pin sandbox creation to a specific `HostSession` ID (`pinned_host=true`).                                                                                                                                                 |
-| `--pinned`                   | `bool`    | `false`             | Pin sandbox to its assigned host (`pinned_host=true`) so automatic bin-packing compaction does not migrate it.                                                                                                            |
-| `--idle-timeout`             | `string`  | `0` (disabled)      | Auto-suspend sandbox after `<N>` seconds or duration (`300`, `5m`, `300s`, `0s`) of no traffic (`0` disables auto-suspend even if fleet `default_idle_timeout_sec > 0`). Automatically sets `persistent=true` when `> 0`. |
-| `--auto-suspend`             | `string`  | `0` (disabled)      | Alias for `--idle-timeout` (accepts integer seconds like `300` or Go duration strings like `5m`, `300s`, `0s`).                                                                                                           |
-| `--no-auto-suspend`          | `bool`    | `false`             | Shorthand for `--idle-timeout=0` to explicitly disable idle auto-suspend for this sandbox even when fleet `default_idle_timeout_sec > 0`.                                                                                 |
-| `--env`                      | `key=val` | none                | Environment variables injected into the sandbox (repeatable or comma-separated `K1=V1,K2=V2`).                                                                                                                            |
-| `--metadata`                 | `key=val` | none                | Arbitrary key-value labels attached to the `SandboxRecord` (repeatable or comma-separated).                                                                                                                               |
-| `--force`                    | `bool`    | `false`             | Force creation/overwrite if targeting an existing sandbox ID.                                                                                                                                                             |
-| `--quiet`, `-q`, `--id-only` | `bool`    | `false`             | Print only the generated `sandbox_id` (`sbx-<host_id>-<8hex>`) to stdout for easy variable capture (`MY_SANDBOX=$(sbx create ... -q)`).                                                                                   |
+### 2.4 `create` — Create a New Sandbox
+
+Creates a sandbox directly on an open candidate `HostSession` (`POST /__session/create`), falling
+back across candidates on `HTTP 429`/`503` and autonomously spawning a new `host-<8hex>` clone when
+all cached candidates are full.
+
+#### Synopsis & Flags
+
+```shell
+sbx create [NAME] [--name=<NAME>] [--template=ubuntu|python|node|postgres|<CUSTOM>] \
+    [--persistent] [--cpu=<CPU>] [--memory=<MEMORY>] [--allow-egress=true|false | --no-allow-egress] \
+    [--from-snapshot=<SNAPSHOT_ID>] [--host=<HOST_ID>] [--pinned] \
+    [--idle-timeout=<DURATION> | --auto-suspend=<DURATION> | --no-auto-suspend] \
+    [--env=<K=V>] [--metadata=<K=V>] [--force] [--quiet | -q | --id-only] [--json]
+```
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--name` | `string` | positional `[NAME]` | Human-readable label; host always mints a unique `sbx-<host_id>-<8hex>` ID. |
+| `--template` | `string` | `ubuntu` | Built-in (`ubuntu`, `python`, `node`, `postgres`) or custom template name. |
+| `--persistent` | `bool` | `false` | Sync writable overlay to GCS (auto-enabled for `postgres` or when idle timeout `> 0`). |
+| `--cpu` | `string` | `1` | CPU allocation (e.g., `1`, `2`, `0.5`, `500m`). |
+| `--memory` | `string` | `1Gi` | Memory allocation (e.g., `512Mi`, `1Gi`, `2Gi`). |
+| `--allow-egress` | `bool` | `true` | Allow outbound internet egress from the sandbox (`false` blocks internet egress). |
+| `--no-allow-egress` | `bool` | `false` | Shorthand for `--allow-egress=false` (enforced in `cloudrun` mode; best-effort in `local`). |
+| `--from-snapshot` | `string` | `""` | Hydrate initial filesystem state from an existing snapshot ID. |
+| `--host` | `string` | `""` | Pin creation to a specific `HostSession` ID (sets `pinned_host=true`). |
+| `--pinned` | `bool` | `false` | Pin sandbox to its host (`pinned_host=true`) so bin-pack compaction skips it. |
+| `--idle-timeout` | `string` | `0` (disabled) | Auto-suspend after `<N>` seconds or duration (`300`, `5m`, `0s`) of inactivity. |
+| `--auto-suspend` | `string` | `0` (disabled) | Alias for `--idle-timeout`. Automatically enables `persistent=true` when `> 0`. |
+| `--no-auto-suspend` | `bool` | `false` | Shorthand for `--idle-timeout=0` (overrides a non-zero fleet `default_idle_timeout_sec`). |
+| `--env` | `key=val` | none | Environment variables injected into the sandbox (repeatable or comma-separated). |
+| `--metadata` | `key=val` | none | Arbitrary key-value labels attached to `SandboxRecord` (repeatable or comma-separated). |
+| `--force` | `bool` | `false` | Overwrite existing ID and **bypass Tier 1 memory-pressure admission control**. |
+| `--quiet`, `-q`, `--id-only` | `bool` | `false` | Print only the generated `sandbox_id` to stdout for shell capture. |
+
+> [!NOTE]
+> Passing `--force` bypasses host memory-pressure admission rejection (`!req.Force` in `hostd.go`);
+> see [OVERLOAD_PROTECTION.md §3](OVERLOAD_PROTECTION.md#tier-1-memory-aware-admission-control-admission_blocked--http-429).
 
 #### Examples
 
-**Quiet ID Capture (`--quiet` / `-q` / `--id-only`):**
+```shell
+# Capture the unique sandbox_id in a variable (-q)
+MY_SANDBOX=$(sbx create data-worker --template=python --persistent -q)
+
+# Standard human-readable output (prints idle_timeout=off when disabled)
+sbx create data-worker --template=python --persistent --cpu=2 --memory=2Gi
+# Output:
+# Created sandbox sbx-host-742e5bf0-a1b2c3d4 (name=data-worker) on host host-742e5bf0 (template=python, status=RUNNING, epoch=1, persistent=true, idle_timeout=off)
+```
+
+---
+
+### 2.5 `list` (Alias: `ls`) — List Sandboxes Across the Fleet
+
+Queries the control-plane in-memory fleet cache (`GET /v1/sandboxes`).
 
 ```shell
-MY_SANDBOX=$(sbx create data-worker \
-    --template=python \
-    --persistent \
-    --quiet)
-echo "$MY_SANDBOX"
+sbx list [--name=<NAME>] [--prefix=<PREFIX>] [--status=RUNNING|SUSPENDED|STOPPED|MIGRATING] [--json]
 ```
 
-```text
-sbx-host-742e5bf0-a1b2c3d4
-```
-
-**Standard Text Output:**
-
-```shell
-sbx create data-worker \
-    --template=python \
-    --persistent \
-    --cpu=2 \
-    --memory=2Gi \
-    --env=PYTHONUNBUFFERED=1,STAGE=prod \
-    --metadata=team=ml,owner=alice
-```
-
-```text
-Created sandbox sbx-host-742e5bf0-a1b2c3d4 (name=data-worker) on host host-742e5bf0 (template=python, status=RUNNING, epoch=1, persistent=true, idle_timeout=0s)
-```
-
-**JSON Output (`--json`):**
-
-```shell
-sbx --json create data-worker --template=python --persistent
-```
-
-```json
-{
-  "sandbox_id": "sbx-host-742e5bf0-a1b2c3d4",
-  "name": "data-worker",
-  "host_id": "host-742e5bf0",
-  "host_revision": "sandbox-pool-00012-xyz",
-  "engine_type": "cloudrun",
-  "epoch": 1,
-  "status": "RUNNING",
-  "template": "python",
-  "persistent": true,
-  "cpu": "1",
-  "memory": "1Gi",
-  "allow_egress": true,
-  "overlay_path": "persistence/sbx-host-742e5bf0-a1b2c3d4/overlay.tar",
-  "created_at": "2026-10-18T07:30:00Z",
-  "updated_at": "2026-10-18T07:30:00Z",
-  "last_active_at": "2026-10-18T07:30:00Z"
-}
-```
-
------
-
-### 2.4 `list` (Alias: `ls`) — List Sandboxes Across the Fleet
-
-Queries the horizontally scaled `sandbox-control-plane` in-memory fleet cache
-(`GET /v1/sandboxes`) and prints both `SANDBOX_ID` and `NAME`.
-
-#### Synopsis
-
-```shell
-sbx list \
-    [--name=<NAME>] \
-    [--prefix=<PREFIX>] \
-    [--status=RUNNING|SUSPENDED|STOPPED|MIGRATING] \
-    [--json]
-```
-
-#### Flags
-
-| Flag       | Type     | Default | Description                                                                  |
-| :--------- | :------- | :------ | :--------------------------------------------------------------------------- |
-| `--name`   | `string` | `""`    | Filter sandboxes by exact `name`.                                            |
-| `--prefix` | `string` | `""`    | Filter sandboxes whose `sandbox_id` or `name` starts with `<PREFIX>`.        |
-| `--status` | `string` | `""`    | Filter by lifecycle status (for example, `RUNNING`, `SUSPENDED`, `STOPPED`). |
-
-#### Example
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--name` | `string` | `""` | Filter sandboxes by exact `name`. |
+| `--prefix` | `string` | `""` | Filter sandboxes whose `sandbox_id` or `name` starts with `<PREFIX>`. |
+| `--status` | `string` | `""` | Filter by lifecycle status (`RUNNING`, `SUSPENDED`, `STOPPED`, `MIGRATING`). |
 
 ```shell
 sbx list --prefix=data-
 ```
 
 ```text
-SANDBOX_ID                   NAME         STATUS    TEMPLATE  HOST_ID         EPOCH  PERSISTENT  MIGRATIONS  RECOVERIES
-sbx-host-742e5bf0-a1b2c3d4   data-worker  RUNNING   python    host-742e5bf0   1      true        0           0
-sbx-host-91c4e012-f0e1d2c3   data-worker  RUNNING   python    host-91c4e012   1      true        0           0
+SANDBOX_ID                   NAME         STATUS    TEMPLATE  HOST_ID         EPOCH  PERSISTENT  IDLE_TIMEOUT  MIGRATIONS  RECOVERIES
+sbx-host-742e5bf0-a1b2c3d4   data-worker  RUNNING   python    host-742e5bf0   1      true        off           0           0
+sbx-host-91c4e012-f0e1d2c3   data-worker  RUNNING   python    host-91c4e012   1      true        300s          0           0
 ```
 
------
+---
 
-### 2.5 `inspect` (Alias: `describe`) — Inspect Detailed Sandbox State & Metrics
+### 2.6 `inspect` (Alias: `describe`) — Inspect Sandbox State & Metrics
 
-Fetches the full `SandboxRecord` JSON directly from the owning host (`GET
-/__session/inspect`), falling back to `GET /v1/sandboxes/<id>` on the control
-plane if the sandbox is currently suspended without an active host. Always
-outputs indented JSON.
-
-#### Synopsis
-
-```shell
-sbx inspect <SANDBOX_ID_OR_NAME>
-```
-
-#### Example
+Fetches the full `SandboxRecord` JSON directly from the owning host (`GET /__session/inspect`),
+falling back to `GET /v1/sandboxes/<id>` on the control plane when the sandbox is suspended.
 
 ```shell
 sbx inspect "$MY_SANDBOX"
@@ -546,741 +363,447 @@ sbx inspect "$MY_SANDBOX"
   "host_id": "host-742e5bf0",
   "host_revision": "sandbox-pool-00012-xyz",
   "engine_type": "cloudrun",
-  "epoch": 1,
+  "epoch": 2,
   "status": "RUNNING",
   "template": "python",
   "persistent": true,
   "cpu": "2",
   "memory": "2Gi",
+  "allocated_cpu_millicores": 2000,
+  "allocated_memory_bytes": 2147483648,
+  "used_memory_bytes": 48234496,
+  "used_memory_pct": 2.2,
+  "peak_memory_bytes": 67108864,
+  "cpu_usage_pct": 2.0,
+  "peak_cpu_usage_pct": 8.5,
   "allow_egress": true,
-  "env": {
-    "PYTHONUNBUFFERED": "1",
-    "STAGE": "prod"
-  },
-  "metadata": {
-    "owner": "alice",
-    "team": "ml"
-  },
+  "idle_timeout_sec": 0,
   "overlay_path": "persistence/sbx-host-742e5bf0-a1b2c3d4/overlay.tar",
-  "migration_count": 0,
+  "migration_count": 1,
   "crash_recoveries": 0,
-  "total_downtime_ms": 0,
+  "total_downtime_ms": 34,
+  "last_migration_freeze_ms": 34,
+  "last_migration_total_ms": 142,
+  "last_migration_mode": "prestaged_delta",
   "created_at": "2026-10-18T07:30:00Z",
   "updated_at": "2026-10-18T07:31:10Z",
   "last_active_at": "2026-10-18T07:31:10Z"
 }
 ```
 
------
+---
 
-### 2.6 `update` — Update CPU, Memory, Idle Timeout, Egress, Environment, and Metadata in Place
+### 2.7 `update` — Update CPU, Memory, Idle Timeout, Egress, Env & Metadata in Place
 
-Dynamically updates a sandbox's resource limits, auto-suspend idle timeout,
-outbound network egress policy, environment variables, or metadata labels (`POST
-/__session/update`).
-
-#### Synopsis
+Dynamically updates a sandbox's configuration on the owning host (`POST /__session/update`).
 
 ```shell
-sbx update <SANDBOX_ID_OR_NAME> \
-    [--cpu=<CPU>] \
-    [--memory=<MEMORY>] \
-    [--idle-timeout=<SECONDS> | --auto-suspend=<SECONDS> | --no-auto-suspend] \
-    [--allow-egress=true|false | --no-allow-egress] \
-    [--env=<KEY=VAL>] \
-    [--metadata=<KEY=VAL>] \
-    [--json]
+sbx update <SANDBOX_ID_OR_NAME> [--cpu=<CPU>] [--memory=<MEMORY>] \
+    [--idle-timeout=<DURATION> | --auto-suspend=<DURATION> | --no-auto-suspend] \
+    [--allow-egress=true|false | --no-allow-egress] [--env=<K=V>] [--metadata=<K=V>] [--json]
 ```
 
-#### Flags
-
-| Flag                | Type      | Default   | Description                                                                                                           |
-| :------------------ | :-------- | :-------- | :-------------------------------------------------------------------------------------------------------------------- |
-| `--cpu`             | `string`  | unchanged | Updated CPU limit (for example, `2` or `500m`).                                                                       |
-| `--memory`          | `string`  | unchanged | Updated memory limit (for example, `4Gi`).                                                                            |
-| `--idle-timeout`    | `string`  | unchanged | Updated auto-suspend idle timeout in seconds or duration (`120`, `2m`, `120s`, `0s`; `0` disables idle auto-suspend). |
-| `--auto-suspend`    | `string`  | unchanged | Alias for `--idle-timeout` (accepts integer seconds like `120` or Go duration strings like `2m`, `120s`, `0s`).       |
-| `--no-auto-suspend` | `bool`    | `false`   | Shorthand for `--idle-timeout=0` to disable idle auto-suspend for this sandbox.                                       |
-| `--allow-egress`    | `bool`    | unchanged | Enable or disable outbound internet egress (`true` or `false`) in place.                                              |
-| `--no-allow-egress` | `bool`    | unchanged | Shorthand for `--allow-egress=false` to disable outbound internet egress in place.                                    |
-| `--env`             | `key=val` | unchanged | Environment variables to merge into the sandbox configuration.                                                        |
-| `--metadata`        | `key=val` | unchanged | Metadata key-value labels to merge into the sandbox configuration.                                                    |
-
-#### Example
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--cpu` | `string` | unchanged | Updated CPU allocation (e.g., `4`, `500m`). |
+| `--memory` | `string` | unchanged | Updated memory allocation (e.g., `4Gi`). |
+| `--idle-timeout` / `--auto-suspend` | `string` | unchanged | Updated auto-suspend timeout (`120`, `2m`, `0s`). |
+| `--no-auto-suspend` | `bool` | `false` | Disable idle auto-suspend (`--idle-timeout=0`). |
+| `--allow-egress` / `--no-allow-egress` | `bool` | unchanged | Enable or disable outbound internet egress in place. |
+| `--env` / `--metadata` | `key=val` | unchanged | Environment variables or metadata labels to merge into `SandboxRecord`. |
 
 ```shell
-sbx update "$MY_SANDBOX" \
-    --cpu=4 \
-    --memory=4Gi \
-    --idle-timeout=120 \
-    --no-allow-egress \
-    --metadata=tier=high-mem
+sbx update "$MY_SANDBOX" --cpu=4 --memory=4Gi --idle-timeout=2m --no-allow-egress
+# Output: Updated sandbox sbx-host-742e5bf0-a1b2c3d4 (cpu=4, memory=4Gi, idle_timeout=120s)
 ```
 
-```text
-Updated sandbox sbx-host-742e5bf0-a1b2c3d4 (cpu=4, memory=4Gi, idle_timeout=120s)
-```
+---
 
------
+### 2.8 `suspend` / `stop` — Checkpoint Overlay to GCS and Release Host Slot
 
-### 2.7 `exec` — Execute Commands Inside a Sandbox (Buffered or Real-Time SSE Stream)
-
-Runs a foreground, real-time SSE streaming (`--stream` / `-s`), or background
-command directly inside the target sandbox (`POST /__session/exec` or `POST
-/__session/exec-stream`).
-
-*   **Real-Time SSE Streaming (`--stream` / `-s`)**: Streams `stdout` and
-    `stderr` chunks in real time over Server-Sent Events (`event: start`,
-    `event: stdout`, `event: stderr`, `event: exit`) while the command runs, and
-    returns the command's exact exit code. Active SSE streams keep the sandbox's
-    activity counter incremented so auto-suspend never fires mid-stream.
-*   **Automatic Wake-on-Exec**: If the sandbox is `SUSPENDED` or `STOPPED`,
-    `hostd` automatically hydrates its saved overlay tarball from GCS, restarts
-    PostgreSQL (for `postgres` sandboxes) and any `background_commands`,
-    transitions it back to `RUNNING`, and executes the command transparently.
-*   **Background Daemons (`--background` & `/workspace/.sbx_init.sh`)**:
-    Commands started with `--background` (or `-d`) are recorded in
-    `background_commands` on the `SandboxRecord` and are **automatically
-    restarted** after live migrations, auto-resume from suspend, or crash
-    recoveries. Additionally, if `/workspace/.sbx_init.sh` exists inside the
-    sandbox, `hostd` automatically executes it in the background on every
-    hydration/resume. (Processes spawned via a foreground `sbx exec` that
-    background themselves with `&` without `-d` or `.sbx_init.sh` are not
-    tracked in `background_commands`.)
-*   **Per-Command Network Egress Override (`--allow-egress` /
-    `--no-allow-egress`)**: Override the sandbox's default `allow_egress`
-    setting for a single command invocation (enforced via Cloud Run
-    `/usr/local/gcp/bin/sandbox do --allow-egress` and socket/proxy guards).
-
-#### Synopsis
-
-```shell
-sbx exec <SANDBOX_ID_OR_NAME> \
-    [--stream | -s] \
-    [--workdir=<DIR>] \
-    [--background | -d] \
-    [--timeout=<SECONDS>] \
-    [--allow-egress=true|false | --no-allow-egress] \
-    [--env=<KEY=VAL>] \
-    -- <COMMAND> [ARGS...]
-```
-
-#### Flags
-
-| Flag                 | Type      | Default         | Description                                                                           |
-| :------------------- | :-------- | :-------------- | :------------------------------------------------------------------------------------ |
-| `--stream`, `-s`     | `bool`    | `false`         | Stream `stdout` and `stderr` chunks in real time over SSE (`/__session/exec-stream`). |
-| `--workdir`          | `string`  | `/workspace`    | Working directory inside the sandbox.                                                 |
-| `--background`, `-d` | `bool`    | `false`         | Run the command asynchronously in the background and return its PID immediately.      |
-| `--timeout`          | `int`     | `60`            | Command execution timeout in seconds.                                                 |
-| `--allow-egress`     | `bool`    | sandbox default | Override outbound internet egress (`true` or `false`) for this command execution.     |
-| `--no-allow-egress`  | `bool`    | sandbox default | Block outbound internet egress for this command execution (`--allow-egress=false`).   |
-| `--env`              | `key=val` | none            | Per-execution environment variables (repeatable or comma-separated).                  |
-
-#### Examples
-
-**Foreground Command:**
-
-```shell
-sbx exec "$MY_SANDBOX" \
-    --workdir=/workspace \
-    --env=DEBUG=1 \
-    -- python3 -c "import os; print('DEBUG =', os.getenv('DEBUG'))"
-```
-
-```text
-DEBUG = 1
-```
-
-**Real-Time SSE Streaming Command (`--stream`):**
-
-```shell
-sbx exec "$MY_SANDBOX" --stream -- python3 -u -c "
-import time
-for i in range(3):
-    print(f'tick {i+1}', flush=True)
-    time.sleep(0.5)
-"
-```
-
-**Background Command with JSON Output:**
-
-```shell
-sbx --json exec "$MY_SANDBOX" \
-    --background \
-    -- python3 -m http.server 9000
-```
-
-```json
-{
-  "sandbox_id": "sbx-host-742e5bf0-a1b2c3d4",
-  "host_id": "host-742e5bf0",
-  "epoch": 1,
-  "exit_code": 0,
-  "stdout": "1842\n",
-  "stderr": "",
-  "pid": 1842,
-  "duration_ms": 14
-}
-```
-
------
-
-### 2.7b `preview-url` & `port-forward` — HTTP/WebSocket Preview URLs and TCP Port Forwarding
-
-Every sandbox supports live HTTP/WebSocket reverse proxying
-(`/proxy/<id_or_name>/<port>/<path>`) and raw TCP port tunneling
-(`/__session/port-forward`).
-
-*   **Wake-on-HTTP / Wake-on-Connect**: If a sandbox is `SUSPENDED` (manual or
-    auto-suspended after idle timeout), an incoming HTTP request to
-    `/proxy/<sandbox_id>/<port>/...` or a `sbx port-forward` connection
-    automatically hydrates the sandbox from GCS, restarts PostgreSQL and any
-    `background_commands`, waits up to 5 seconds for the listening port to bind,
-    and serves the request transparently!
-
-#### Synopsis
-
-```shell
-# Print the HTTP/WebSocket preview URL for a port inside a sandbox
-sbx preview-url <SANDBOX_ID_OR_NAME> [--port=8080] [--path=/] [--json]
-
-# Forward a local TCP port to a remote port inside a sandbox (e.g. web server or PostgreSQL 5432)
-sbx port-forward <SANDBOX_ID_OR_NAME> <LOCAL_PORT>:<REMOTE_PORT>
-```
-
-#### Examples
-
-```shell
-# Get the preview URL for port 8080 and query it with curl
-URL=$(sbx preview-url "$MY_SANDBOX" --port=8080 --path=/healthz)
-curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL"
-
-# Forward local TCP port 15432 to PostgreSQL port 5432 inside a Postgres sandbox
-sbx port-forward "$MY_PG" 15432:5432
-```
-
------
-
-### 2.8 `ssh` — Open an Interactive Shell Session Inside a Sandbox
-
-Opens an interactive line-oriented REPL shell session connected to `/workspace`
-inside the sandbox. Type `exit` or `quit` (or press `Ctrl-D`) to disconnect.
-
-#### Synopsis
-
-```shell
-sbx ssh <SANDBOX_ID_OR_NAME>
-```
-
-#### Example
-
-```shell
-sbx ssh "$MY_SANDBOX"
-```
-
-```text
-Connected to interactive session on sandbox sbx-host-742e5bf0-a1b2c3d4 (type 'exit' to quit)
-sbx-host-742e5bf0-a1b2c3d4:/workspace# uname -a
-Linux localhost 6.6.x #1 SMP x86_64 GNU/Linux
-sbx-host-742e5bf0-a1b2c3d4:/workspace# exit
-```
-
------
-
-### 2.9 `cp` — Copy Files Between Local Machine and Sandbox
-
-Uploads a local file into a sandbox or downloads a file from a sandbox to the
-local machine (`POST /__session/cp`). All remote paths are validated with
-`SafeResolvePath` to prevent directory traversal outside the sandbox root.
-
-#### Synopsis
-
-```shell
-# Upload local file to sandbox
-sbx cp <LOCAL_PATH> <SANDBOX_ID_OR_NAME>:<REMOTE_PATH> [--json]
-
-# Download file from sandbox to local machine
-sbx cp <SANDBOX_ID_OR_NAME>:<REMOTE_PATH> <LOCAL_PATH> [--json]
-```
-
-#### Examples
-
-```shell
-# Upload a script into /workspace/train.py
-sbx cp ./train.py "$MY_SANDBOX":/workspace/train.py
-# Output: Uploaded 4096 bytes to sbx-host-742e5bf0-a1b2c3d4:/workspace/train.py
-
-# Download results from /workspace/metrics.json
-sbx cp "$MY_SANDBOX":/workspace/metrics.json ./metrics.json
-# Output: Downloaded 512 bytes from sbx-host-742e5bf0-a1b2c3d4:/workspace/metrics.json to ./metrics.json
-```
-
------
-
-### 2.10 `logs` — Fetch Stdout, Stderr, and System Lifecycle Logs
-
-Retrieves recent execution output, background process logs, and lifecycle events
-(`CREATE`, `MIGRATE`, `SUSPEND`, `RESUME`) for a sandbox (`GET
-/__session/logs`).
-
-#### Synopsis
-
-```shell
-sbx logs <SANDBOX_ID_OR_NAME> \
-    [--tail=<LINES>] \
-    [--json]
-```
-
-#### Flags
-
-| Flag     | Type  | Default   | Description                              |
-| :------- | :---- | :-------- | :--------------------------------------- |
-| `--tail` | `int` | `0` (all) | Number of trailing log lines to display. |
-
-#### Example
-
-```shell
-sbx logs "$MY_SANDBOX" --tail=50
-```
-
-```text
-[2026-10-18T07:30:00Z] Sandbox sbx-host-742e5bf0-a1b2c3d4 started on host host-742e5bf0 (template=python, engine=cloudrun)
-[2026-10-18T07:30:12Z] EXEC [python3 /workspace/train.py] -> exit=0 (42ms)
-Epoch 1: loss=0.142
-```
-
------
-
-### 2.11 `suspend` / `stop` — Snapshot Overlay to GCS and Release Host Capacity
-
-Quiesces the sandbox (for example, running `CHECKPOINT` and `pg_ctl stop` for
-PostgreSQL sandboxes), exports the full writable `rootfs-upper` overlay tarball
-to `persistence/<sandbox_id>/overlay.tar` in GCS, stops the container, and
-releases the slot on the host session (`POST /__session/suspend` or `POST
-/__session/stop`). When the last running sandbox on a host is suspended, the
-host marks `/sys/class/instance/state` as `idle` so Cloud Run scales the
-instance to zero.
-
-#### Synopsis
+Quiesces the sandbox (running `CHECKPOINT` and `pg_ctl stop` for `postgres`), exports
+`persistence/<sandbox_id>/overlay.tar` to GCS, stops the container, and releases the host slot
+(`POST /__session/suspend` transitions to `SUSPENDED`; `POST /__session/stop` transitions to
+`STOPPED`).
 
 ```shell
 sbx suspend <SANDBOX_ID_OR_NAME> [--json]
 sbx stop <SANDBOX_ID_OR_NAME> [--json]
 ```
 
-#### Example
+---
 
-```shell
-sbx suspend "$MY_SANDBOX"
-```
+### 2.9 `resume` / `start` — Hydrate a Suspended or Stopped Sandbox
 
-```text
-Sandbox sbx-host-742e5bf0-a1b2c3d4 is now SUSPENDED (overlay saved to persistence/sbx-host-742e5bf0-a1b2c3d4/overlay.tar)
-```
-
------
-
-### 2.12 `resume` / `start` — Hydrate a Suspended or Stopped Sandbox Back to `RUNNING`
-
-Hydrates a `SUSPENDED` or `STOPPED` sandbox onto an available warm `HostSession`
-(or spawns a new host session if needed), imports its saved overlay tarball
-(`persistence/<sandbox_id>/overlay.tar`), increments `epoch`, restarts any
-registered background commands or PostgreSQL services, and transitions the
-sandbox back to `RUNNING`.
+Hydrates a `SUSPENDED` or `STOPPED` sandbox onto an open warm `HostSession` (or spawns a new host),
+imports `overlay.tar`, increments `epoch`, restarts PostgreSQL, `background_commands`, and
+`/workspace/.sbx_init.sh`, and marks the sandbox `RUNNING`.
 
 > [!TIP]
-> You do not even need to run `sbx resume` manually before `sbx exec`
-> or `sbx cp`—any `exec` or `cp` call against a suspended sandbox automatically
-> triggers wake-on-demand hydration!
-
-#### Synopsis
+> Running `sbx exec`, `sbx cp`, `sbx port-forward`, or sending an HTTP request to a suspended
+> sandbox's preview URL automatically wakes and resumes the sandbox without requiring a manual
+> `sbx resume`.
 
 ```shell
 sbx resume <SANDBOX_ID_OR_NAME> [--json]
 sbx start <SANDBOX_ID_OR_NAME> [--json]
 ```
 
-#### Example
+---
+
+### 2.10 `delete` (Alias: `rm`) — Delete One or More Sandboxes
+
+Stops and deletes one or more sandboxes (`POST /__session/delete`), removing
+`sandboxes/<sandbox_id>.json` and `persistence/<sandbox_id>/overlay.tar` from GCS.
 
 ```shell
-sbx resume "$MY_SANDBOX"
+sbx delete <SANDBOX_ID_OR_NAME> [SANDBOX_ID_2...] [--force] [--json]
 ```
 
-```text
-Sandbox sbx-host-742e5bf0-a1b2c3d4 resumed on host host-742e5bf0 (status=RUNNING, epoch=2)
-```
+---
 
------
+### 2.11 `exec` — Execute Commands Inside a Sandbox (Buffered or SSE Stream)
 
-### 2.13 `migrate` — Live-Migrate a Running Sandbox or Drain an Entire Host
+Runs a foreground, real-time SSE streaming (`--stream` / `-s`), or background (`--background` /
+`-d`) command inside the sandbox (`POST /__session/exec` or `POST /__session/exec-stream`).
 
-Performs a coordinated live migration (`POST /__session/migrate`) of a single
-sandbox to a specific target host (or an automatically selected warm host), or
-drains all sandboxes off a specified host session (`--host=<HOST_ID>`).
+* **Real-Time SSE Streaming (`--stream` / `-s`)**: Streams `stdout` and `stderr` chunks as
+  Server-Sent Events (`start`, `stdout`, `stderr`, `exit`) and exits with the remote command's exit
+  code.
+* **Persistent Background Daemons (`--background` / `-d` & `/workspace/.sbx_init.sh`)**: Commands
+  started with `-d` are saved in `background_commands` on `SandboxRecord` and are automatically
+  restarted after live migrations, wake-from-suspend, or crash recoveries. If
+  `/workspace/.sbx_init.sh` exists, `hostd` also executes it in the background on every
+  hydration/resume.
 
-During live migration:
-
-1.  `hostd` quiesces in-guest databases (such as PostgreSQL) and exports the
-    writable overlay to GCS.
-2.  The target host imports the overlay via `POST /__internal/hydrate`,
-    increments `epoch` in `sandboxes/<sandbox_id>.json` with CAS fencing, and
-    restarts background processes.
-3.  The source host removes its local container and redirects any stale clients
-    via `HTTP 409 Conflict` (`X-Sandbox-Host-Session: <new_host_id>`).
-
-#### Synopsis
+#### Synopsis & Flags
 
 ```shell
-# Migrate a single sandbox (auto-selecting target host or pinning to --to-host)
-sbx migrate <SANDBOX_ID_OR_NAME> \
-    [--to-host=<TARGET_HOST_ID>] \
-    [--target-host=<TARGET_HOST_ID>] \
-    [--json]
+sbx exec <SANDBOX_ID_OR_NAME> [--stream | -s] [--workdir=<DIR>] [--background | -d] \
+    [--timeout=<DURATION>] [--allow-egress=true|false | --no-allow-egress] [--env=<K=V>] \
+    -- <COMMAND> [ARGS...]
+```
 
-# Drain all sandboxes from an entire host session
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--stream`, `-s` | `bool` | `false` | Stream `stdout`/`stderr` in real time over SSE (`/__session/exec-stream`). |
+| `--workdir` | `string` | `/workspace` | Working directory inside the sandbox. |
+| `--background`, `-d` | `bool` | `false` | Run asynchronously in the background, record in `background_commands`, and return PID. |
+| `--timeout` | `string` | `60` (`60s`) | Execution timeout in integer seconds (`60`) or Go duration (`30s`, `2m`, `10m`). |
+| `--allow-egress` / `--no-allow-egress` | `bool` | sandbox default | Override outbound internet egress for this command execution. |
+| `--env` | `key=val` | none | Per-execution environment variables (repeatable or comma-separated). |
+
+#### Examples
+
+```shell
+# Foreground command with custom environment
+sbx exec "$MY_SANDBOX" --env=DEBUG=1 -- python3 -c "import os; print(os.getenv('DEBUG'))"
+
+# Real-time SSE streaming (-s) with a 5-minute timeout
+sbx exec "$MY_SANDBOX" -s --timeout=5m -- sh -c 'for i in 1 2 3; do echo "tick $i"; sleep 1; done'
+
+# Start a persistent background HTTP server (-d)
+sbx exec "$MY_SANDBOX" -d -- python3 -m http.server 8000
+```
+
+---
+
+### 2.12 `preview-url` (Alias: `preview`) — IAM-Authenticated HTTP/WebSocket Preview URLs
+
+Constructs and prints the reverse-proxy preview URL
+(`<control_plane_url>/proxy/<id_or_name>/<port>/<path>`) for a port listening inside a sandbox.
+
+* **Authentication & Header Isolation**: Preview URLs are protected by Cloud Run IAM
+  (`roles/run.invoker` on `sandbox-control-plane`), not exposed anonymously. Pass
+  `Authorization: Bearer $(gcloud auth print-identity-token)` when calling from `curl` or
+  programmatic clients, or open via the IAP-authenticated `sandbox-ui` **"Open Preview URL"** button
+  (`/proxy/<id_or_name>/<port>/...`):
+  * IAP and platform credentials (`X-Serverless-*`, `X-Goog-Iap-*`, `Authorization`, and
+    `GCP_IAAP_*` / `__Host-sbx_csrf` cookies) are stripped at every hop, while application cookies
+    are preserved.
+  * Send `X-Sandbox-Authorization` if you want your sandbox app to receive an `Authorization`
+    header.
+  * Root-relative `Location` redirects (e.g., `/login`) stay under `/proxy/<id_or_name>/<port>/...`.
+* **WebSockets & Wake-on-HTTP**: Supports HTTP and WebSocket (`Upgrade: websocket`) traffic. If the
+  target sandbox is `SUSPENDED`, the first incoming request automatically hydrates the sandbox from
+  GCS, restarts `background_commands` and `/workspace/.sbx_init.sh`, retries dialing the target
+  port for up to **5 seconds** while the server binds, and serves the response.
+
+#### Synopsis & Flags
+
+```shell
+sbx preview-url <SANDBOX_ID_OR_NAME> [PORT] [--port=8000] [--path=/] [--json]
+```
+
+| Flag / Arg | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `[PORT]` or `--port` | `int` | `8000` | Target TCP port listening inside the sandbox. |
+| `--path` | `string` | `/` | URL subpath appended after `/proxy/<id>/<port>`. |
+| `--json` | `bool` | `false` | Emit JSON containing `sandbox_id`, `port`, `preview_url`, and `curl_example`. |
+
+```shell
+URL=$(sbx preview-url "$MY_SANDBOX" --port=8000 --path=/healthz)
+curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL"
+```
+
+---
+
+### 2.13 `port-forward` (Alias: `forward`) — Local TCP Port Tunneling
+
+Listens on a local TCP port (`127.0.0.1:<LOCAL_PORT>`) and tunnels connections over
+`/__session/port-forward` (`Upgrade: tcp`) into `<REMOTE_PORT>` inside the sandbox. Automatically
+wakes `SUSPENDED` sandboxes on connect and keeps `activeConns` incremented while tunnels are open.
+
+#### Synopsis & Flags
+
+```shell
+sbx port-forward <SANDBOX_ID_OR_NAME> [<LOCAL_PORT>:<REMOTE_PORT> | <PORT>] [--port=<PORT>]
+```
+
+| Argument / Flag | Description |
+| :--- | :--- |
+| `<LOCAL_PORT>:<REMOTE_PORT>` | Forward `127.0.0.1:<LOCAL_PORT>` to `<REMOTE_PORT>` inside the sandbox (e.g., `15432:5432`). |
+| `<PORT>` or `--port=<PORT>` | Shorthand when local and remote ports are identical (e.g., `sbx port-forward "$SBX" 8000`). |
+
+```shell
+# Forward local port 15432 to PostgreSQL port 5432 inside the sandbox
+sbx port-forward "$MY_PG" 15432:5432
+```
+
+---
+
+### 2.14 `ssh` — Open an Interactive Line-REPL Shell
+
+Opens an interactive line-oriented command loop connected to `/workspace` inside the sandbox. Type
+`exit` or `quit` (or `Ctrl-D`) to disconnect.
+
+> [!NOTE]
+> `sbx ssh` is a lightweight line-oriented REPL built on `/__session/exec` without PTY allocation,
+> so full-screen terminal programs (`vim`, `top`, `htop`, `less`) are not supported.
+
+```shell
+sbx ssh "$MY_SANDBOX"
+```
+
+---
+
+### 2.15 `cp` — Copy Files Between Local Machine and Sandbox
+
+Uploads or downloads files (`POST /__session/cp`). Remote paths are validated with
+`SafeResolvePath` to prevent path traversal outside the sandbox root.
+
+```shell
+# Upload local file to sandbox
+sbx cp ./train.py "$MY_SANDBOX":/workspace/train.py [--json]
+
+# Download file from sandbox to local machine
+sbx cp "$MY_SANDBOX":/workspace/metrics.json ./metrics.json [--json]
+```
+
+---
+
+### 2.16 `logs` — Fetch Stdout, Stderr, and Lifecycle Logs
+
+Fetches command output, background daemon logs, and lifecycle events
+(`GET /__session/logs?tail=<N>`).
+
+```shell
+sbx logs <SANDBOX_ID_OR_NAME> [--tail=<LINES>] [--json]
+```
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--tail` | `int` | `0` (all) | Slice and return only the last `<N>` lines on the server. |
+
+---
+
+### 2.17 `copy` (Alias: `fork`) — Clone a Running Sandbox
+
+Clones a source sandbox's writable filesystem, environment variables, and template settings into a
+new sandbox (`POST /__session/copy`) with a newly minted `sbx-<host_id>-<8hex>` ID:
+
+* **Same-Host Copy-on-Write (`fork_method`)**: When `--target-host` is omitted (or matches the
+  source host) and the source host has open capacity, `hostd` clones in place via
+  `cloudrun_cow_fork` (Cloud Run Sandbox Runtime native CoW fork, with `tar_overlay_clone`
+  fallback) or `local_overlay_fork` (`LocalProcessEngine`).
+* **Cross-Host Clone (`cross_host_snapshot_clone`)**: When `--target-host` targets a different host
+  (or the source host is full), `hostd` exports a snapshot tarball and hydrates the clone onto the
+  target host.
+
+#### Synopsis & Flags
+
+```shell
+sbx copy <SOURCE_ID_OR_NAME> <TARGET_NAME> [--target-host=<HOST_ID> | --to-host=<HOST_ID>] \
+    [--persistent] [--force] [--quiet | -q | --id-only] [--json]
+```
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--target-host` (alias `--to-host`) | `string` | same host (if free slot) | Target `HostSession` ID for cross-host cloning. |
+| `--persistent` | `bool` | inherits source | Mark the cloned sandbox as persistent (`req.Persistent \|\| srcRec.Persistent`). |
+| `--force` | `bool` | `false` | Overwrite target if a conflicting record exists. |
+| `--quiet`, `-q`, `--id-only` | `bool` | `false` | Print only the newly minted `sandbox_id` to stdout. |
+
+```shell
+sbx copy "$MY_SANDBOX" my-dev-box-clone --persistent
+# Output: Copied sandbox sbx-host-742e5bf0-a1b2c3d4 -> sbx-host-742e5bf0-e5f60718 (name=my-dev-box-clone) on host host-742e5bf0 (method=cloudrun_cow_fork)
+```
+
+---
+
+### 2.18 `snapshot` (`create`, `list`, `delete` / `rm`) — Point-in-Time Filesystem Snapshots
+
+Captures, lists, or deletes point-in-time filesystem snapshots (`snapshots/<snapshot_id>.json` and
+`snapshots/<snapshot_id>.tar` in GCS).
+
+```shell
+sbx snapshot create <SANDBOX_ID_OR_NAME> [--name=<SNAPSHOT_ID>] [--force] [--json]
+sbx snapshot list [--json]
+sbx snapshot delete <SNAPSHOT_ID>   # alias: sbx snapshot rm <SNAPSHOT_ID>
+```
+
+| Flag (`snapshot create`) | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--name` | `string` | `snap-<8hex>` | Custom identifier for the snapshot. |
+| `--force` | `bool` | `false` | Overwrite an existing snapshot with the same `--name`. |
+
+---
+
+### 2.19 `template` (`list`, `create` / `add`, `delete` / `rm`) — Built-in & Custom Templates
+
+*(Command alias: `sbx templates`)*
+
+Manages built-in pre-warmed templates (`ubuntu`, `python`, `node`, `postgres` — protected from
+deletion/overwrite) and custom snapshot-backed templates.
+
+```shell
+sbx template list [--json]
+sbx template create <TEMPLATE_NAME> [--from-sandbox=<ID_OR_NAME> | --from-snapshot=<SNAP_ID>] \
+    [--base-template=ubuntu|python|node|postgres] [--image=<IMAGE>] [--description=<TEXT>] [--force] [--json]
+sbx template delete <TEMPLATE_NAME>   # alias: sbx template rm <TEMPLATE_NAME>
+```
+
+| Flag (`template create` / `add`) | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--from-sandbox` | `string` | `""` | Server-side snapshot `<ID_OR_NAME>` as `snap-tpl-<NAME>` and register template. |
+| `--from-snapshot` | `string` | `""` | Back the custom template with an existing `<SNAPSHOT_ID>`. |
+| `--base-template` | `string` | `ubuntu` (or source's) | Underlying base runtime template (`ubuntu`, `python`, `node`, `postgres`). |
+| `--image` | `string` | base template's image | Container image recorded in `TemplateSpec` (defaults to base template's image, fallback `ubuntu:24.04`). |
+| `--description` | `string` | `""` | Human-readable description of the template. |
+| `--force` | `bool` | `false` | Overwrite an existing custom template with the same name. |
+
+* Deleting a custom template (`sbx template delete <NAME>`) also cleans up its auto-generated
+  `snap-tpl-<NAME>` snapshot.
+
+---
+
+### 2.20 `migrate` — Two-Phase Pre-Copy Live Migration or Host Drain
+
+Live-migrates a single sandbox to a target host (`POST /__session/migrate`) or drains all running
+sandboxes from a host (`--host=<SOURCE_HOST_ID>`).
+
+#### How Two-Phase Pre-Copy Live Migration Works
+
+1. **Phase 1 — Warm Pre-Copy (`POST /__internal/prestage`, `0ms` Downtime)**: While the sandbox
+   stays `RUNNING` on the source host (`sbxMu` unlocked, continuing to serve `exec` and `/proxy`
+   traffic), the source host exports the base filesystem tar and streams it to the destination host
+   (multipart up to `30 MiB`, or via a Store blob for larger bases), which unpacks it, warms the
+   container, and stores `prestaged[sandboxID]` (`3m` TTL).
+2. **Phase 2 — Brief Freeze & Direct Delta Cutover (`POST /__internal/hydrate` with
+   `prestaged: true`)**: The source host acquires `sbxMu`, marks the sandbox `MIGRATING`, waits up
+   to `2s` for in-flight `exec`/`cp` calls to complete, runs `/workspace/.sbx_pre_migrate.sh` (and
+   `Quiesce` `CHECKPOINT` + clean `pg_ctl stop` for `postgres`), computes only modified/deleted
+   files since Phase 1 (`ExportDeltaTar`), and streams the delta (`<= 20 MiB` inline) directly
+   host-to-host over HTTP. The destination host applies `ApplyDeltaTar`, restarts PostgreSQL,
+   `background_commands`, and `.sbx_init.sh`, and increments `epoch` via GCS CAS (`RPO=0`).
+3. **Telemetry & Fallback**: `sbx inspect` reports the following migration telemetry fields:
+
+   | `SandboxRecord` Field | Meaning |
+   | :--- | :--- |
+   | `last_migration_freeze_ms` | Phase 2 cutover freeze window, timed from the source host's `freezeStart`. |
+   | `last_migration_total_ms` | End-to-end Phase 1 + Phase 2 migration duration (including any target cold start in Phase 1). |
+   | `last_migration_mode` | `"prestaged_delta"` (Two-Phase Pre-Copy) or `"gcs_full"` (automatic full GCS hydration fallback). |
+   | `total_downtime_ms` | Cumulative cutover freeze milliseconds across all migrations and crash recoveries. |
+
+   Live Cloud Run (`us-west1`): **`~0.45 s` server freeze / `~0.78 s` client-observed HTTP freeze**
+   vs **`~4.38 s` before (−82% / `5.6×` shorter)**; see
+   [ARCHITECTURE.md §2.3](ARCHITECTURE.md#23-two-phase-pre-copy-live-migration).
+
+#### Synopsis & Flags
+
+```shell
+sbx migrate <SANDBOX_ID_OR_NAME> [--to-host=<TARGET_HOST_ID> | --target-host=<TARGET_HOST_ID>] [--json]
 sbx migrate --host=<SOURCE_HOST_ID> [--json]
 ```
 
-#### Flags
-
-| Flag            | Type     | Default       | Description                                                                         |
-| :-------------- | :------- | :------------ | :---------------------------------------------------------------------------------- |
-| `--to-host`     | `string` | auto-selected | Destination `HostSession` ID to migrate the sandbox onto (sets `pinned_host=true`). |
-| `--target-host` | `string` | auto-selected | Alias for `--to-host`.                                                              |
-| `--host`        | `string` | `""`          | Evacuate and drain all sandboxes currently running on `<SOURCE_HOST_ID>`.           |
-
-#### Examples
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--to-host` (alias `--target-host`) | `string` | auto-selected | Destination `HostSession` ID (sets `pinned_host=true`). |
+| `--host` | `string` | `""` | Evacuate and drain all running sandboxes from `<SOURCE_HOST_ID>`. |
 
 ```shell
-# Migrate a single sandbox to a specific host session
 sbx migrate "$MY_SANDBOX" --to-host=host-91c4e012
 # Output: Migrated sandbox sbx-host-742e5bf0-a1b2c3d4 from host-742e5bf0 -> host-91c4e012 (epoch=2)
 
-# Drain all sandboxes from host-742e5bf0 onto other fleet hosts
 sbx migrate --host=host-742e5bf0
-# Output: Drained host host-742e5bf0: [sbx-host-742e5bf0-a1b2c3d4->host-91c4e012]
+# Output: Drained host host-742e5bf0 (migrated: sbx-host-742e5bf0-a1b2c3d4->host-91c4e012)
 ```
 
------
+---
 
-### 2.14 `copy` (Alias: `fork`) — Clone a Running Sandbox via CoW Fork or Cross-Host Snapshot
+### 2.21 `hosts` (`list`, `drain`, `compact`, `simulate-crash`) — Manage Host Sessions
 
-Clones a source sandbox's entire writable filesystem, environment variables, and
-template settings into a new sandbox (`POST /__session/copy`) with
-`name=<TARGET_NAME>` and a newly generated globally unique `sandbox_id`
-(`sbx-<host_id>-<8hex>`):
-
-*   **Same-Host Copy-on-Write (`cloudrun-cow-fork` / `local-cow-copy`)**: When
-    `--target-host` is omitted (or matches the source host) and the source host
-    has a free slot, `hostd` forks the container overlay directly on the same
-    host for sub-second cloning.
-*   **Cross-Host Clone (`cross-host-tar-clone`)**: When `--target-host`
-    specifies a different host (or the source host is at `max_density`), `hostd`
-    exports a snapshot tarball and hydrates the new clone onto the target host
-    session.
-
-#### Synopsis
+Inspects active `sandbox-pool` host clones (`GET /v1/hosts`), drains a host
+(`POST /v1/hosts/<id>/drain`), triggers bin-packing compaction across sparse hosts
+(`POST /v1/compact`), or simulates an ungraceful `SIGKILL` crash
+(`POST /v1/hosts/<id>/simulate-crash`) to test watchdog recovery.
 
 ```shell
-sbx copy <SOURCE_SANDBOX_ID_OR_NAME> <TARGET_NAME> \
-    [--target-host=<HOST_ID>] \
-    [--to-host=<HOST_ID>] \
-    [--persistent] \
-    [--force] \
-    [--quiet | -q | --id-only] \
-    [--json]
-```
-
-#### Flags
-
-| Flag                         | Type     | Default                        | Description                                                                                                                     |
-| :--------------------------- | :------- | :----------------------------- | :------------------------------------------------------------------------------------------------------------------------------ |
-| `--target-host`              | `string` | same host (if capacity allows) | Target `HostSession` ID for cross-host cloning.                                                                                 |
-| `--to-host`                  | `string` | `""`                           | Alias for `--target-host`.                                                                                                      |
-| `--persistent`               | `bool`   | inherits source                | Mark the cloned sandbox as persistent.                                                                                          |
-| `--force`                    | `bool`   | `false`                        | Overwrite target if a conflicting record exists.                                                                                |
-| `--quiet`, `-q`, `--id-only` | `bool`   | `false`                        | Print only the newly cloned `sandbox_id` (`sbx-<host_id>-<8hex>`) to stdout (`MY_CLONE=$(sbx copy "$MY_SANDBOX" my-clone -q)`). |
-
-#### Examples
-
-```shell
-# Standard output (mints a new unique sbx-<host_id>-<8hex> ID with name=my-dev-box-clone)
-sbx copy "$MY_SANDBOX" my-dev-box-clone --persistent
-# Output: Copied sandbox sbx-host-742e5bf0-a1b2c3d4 -> sbx-host-742e5bf0-e5f60718 (name=my-dev-box-clone) on host host-742e5bf0 (method=local_overlay_fork)
-
-# Capture cloned sandbox_id directly with --quiet (-q)
-MY_CLONE=$(sbx copy "$MY_SANDBOX" branch-experiment-2 --persistent --quiet)
-echo "Cloned sandbox: $MY_CLONE"
-# Output: Cloned sandbox: sbx-host-742e5bf0-e1f2a3b4
-```
-
------
-
-### 2.15 `snapshot` (`create`, `list`, `delete`) — Manage Point-in-Time Filesystem Snapshots
-
-Captures, lists, or deletes immutable point-in-time filesystem snapshots
-(`snapshots/<snapshot_id>.json` and `snapshots/<snapshot_id>.tar` in GCS). Saved
-snapshots can be used to seed new sandboxes (`sbx create
---from-snapshot=<SNAPSHOT_ID>`) or registered as reusable templates (`sbx
-template create --from-snapshot=<SNAPSHOT_ID>`).
-
-#### Synopsis
-
-```shell
-# Create a point-in-time snapshot from a sandbox
-sbx snapshot create <SANDBOX_ID_OR_NAME> \
-    [--name=<SNAPSHOT_ID>] \
-    [--force] \
-    [--json]
-
-# List all snapshots in the fleet (default action if subcommand omitted)
-sbx snapshot list [--json]
-
-# Delete a snapshot
-sbx snapshot delete <SNAPSHOT_ID>
-```
-
-#### Flags (`snapshot create`)
-
-| Flag      | Type     | Default         | Description                                            |
-| :-------- | :------- | :-------------- | :----------------------------------------------------- |
-| `--name`  | `string` | `snap-<random>` | Custom identifier for the snapshot.                    |
-| `--force` | `bool`   | `false`         | Overwrite an existing snapshot with the same `--name`. |
-
-#### Examples
-
-```shell
-# Capture a named snapshot
-sbx snapshot create "$MY_SANDBOX" --name=snap-py-deps-v1 --force
-# Output: Created snapshot snap-py-deps-v1 from sbx-host-742e5bf0-a1b2c3d4 (184320 bytes)
-
-# List available snapshots
-sbx snapshot list
-```
-
-```text
-SNAPSHOT_ID      SOURCE_SANDBOX              TEMPLATE  SIZE_BYTES  CREATED_AT
-snap-py-deps-v1  sbx-host-742e5bf0-a1b2c3d4  python    184320      2026-10-18T07:35:00Z
-```
-
-```shell
-# Boot a new sandbox from the snapshot
-MY_RESTORED=$(sbx create worker-from-snap \
-    --template=python \
-    --from-snapshot=snap-py-deps-v1 \
-    --quiet)
-
-# Delete a snapshot when no longer needed
-sbx snapshot delete snap-py-deps-v1
-```
-
------
-
-### 2.16 `template` (`list`, `create` / `add`, `delete`) — Manage Built-in & Custom Templates
-
-Lists built-in pre-warmed templates (`ubuntu`, `python`, `node`, `postgres`) and
-custom snapshot-backed templates, registers new custom templates from either an
-existing snapshot (`--from-snapshot`) or a live sandbox (`--from-sandbox`), or
-deletes custom templates.
-
-> [!IMPORTANT]
-> Built-in templates (`ubuntu`, `python`, `node`, `postgres`)
-> are protected and cannot be overwritten or deleted.
-
-#### Synopsis
-
-```shell
-# List all built-in and custom templates
-sbx template list [--json]
-
-# Register a new custom template (alias: `sbx template add`)
-sbx template create <TEMPLATE_NAME> \
-    [--from-sandbox=<SANDBOX_ID_OR_NAME> | --from-snapshot=<SNAPSHOT_ID>] \
-    [--base-template=ubuntu|python|node|postgres] \
-    [--image=<CONTAINER_IMAGE>] \
-    [--description=<TEXT>] \
-    [--force] \
-    [--json]
-
-# Delete a custom template
-sbx template delete <TEMPLATE_NAME>
-```
-
-#### Flags (`template create` / `template add`)
-
-| Flag              | Type     | Default                                 | Description                                                                                       |
-| :---------------- | :------- | :-------------------------------------- | :------------------------------------------------------------------------------------------------ |
-| `--from-sandbox`  | `string` | `""`                                    | Automatically snapshot `<SANDBOX_ID_OR_NAME>` as `snap-tpl-<NAME>` and back the template with it. |
-| `--from-snapshot` | `string` | `""`                                    | Back the custom template with an existing `<SNAPSHOT_ID>`.                                        |
-| `--base-template` | `string` | `ubuntu` (or source sandbox's template) | Underlying base runtime template (`ubuntu`, `python`, `node`, `postgres`).                        |
-| `--image`         | `string` | `ubuntu:24.04`                          | Container image reference recorded in `TemplateSpec`.                                             |
-| `--description`   | `string` | `""`                                    | Human-readable description of the template.                                                       |
-| `--force`         | `bool`   | `false`                                 | Overwrite an existing custom template with the same `<TEMPLATE_NAME>`.                            |
-
-#### Examples
-
-```shell
-# Register a custom template directly from a configured sandbox
-sbx template create ml-pandas \
-    --from-sandbox="$MY_SANDBOX" \
-    --description="Python 3.12 with pandas, numpy, and scikit-learn pre-installed" \
-    --force
-# Output: Registered template ml-pandas (type=snapshot, snapshot=snap-tpl-ml-pandas)
-
-# List all templates
-sbx template list
-```
-
-```text
-NAME       TYPE       IMAGE                             SNAPSHOT_ID         DESCRIPTION
-ml-pandas  snapshot   ubuntu:24.04                      snap-tpl-ml-pandas  Python 3.12 with pandas, numpy, and scikit-learn pre-installed
-node       prewarmed  node:22-slim                                          Node.js 22 LTS runtime sandbox for JS/TS agents and toolchains
-postgres   prewarmed  mirror.gcr.io/library/postgres:16                     PostgreSQL 16 stateful database sandbox with libfakeuid.so & PGDATA=/pgdata/data overlay persistence
-python     prewarmed  python:3.12-slim                                      Python 3.12 runtime sandbox pre-warmed for AI code execution
-ubuntu     prewarmed  ubuntu:24.04                                          Ubuntu 24.04 LTS general-purpose sandbox with curl, git, python3, tar
-```
-
------
-
-### 2.17 `delete` (Alias: `rm`) — Delete One or More Sandboxes
-
-Stops and deletes one or more sandboxes (`POST /__session/delete`), removing
-their ownership records (`sandboxes/<sandbox_id>.json`), persisted overlay
-tarballs, and freeing their host capacity slots.
-
-#### Synopsis
-
-```shell
-sbx delete <SANDBOX_ID_OR_NAME> [SANDBOX_ID_2...] \
-    [--force] \
-    [--json]
-```
-
-#### Example
-
-```shell
-sbx delete "$MY_SANDBOX" "$MY_CLONE"
-```
-
-```text
-Deleted sandbox sbx-host-742e5bf0-a1b2c3d4
-Deleted sandbox sbx-host-742e5bf0-c9d8e7f6
-```
-
------
-
-### 2.18 `hosts` (`list`, `drain`, `compact`, `simulate-crash`) — Manage Host Sessions & Bin-Packing
-
-Inspects active `sandbox-pool` session clones (`GET /v1/hosts`), drains a
-specific host session, triggers immediate fleet-wide bin-packing defragmentation
-(`POST /v1/compact`), or simulates an ungraceful `SIGKILL` host crash (`POST
-/v1/hosts/<id>/simulate-crash`) to test watchdog resurrection.
-
-#### Synopsis
-
-```shell
-# List all host sessions in the fleet
 sbx hosts list [--json]
-
-# Gracefully evacuate all sandboxes from a host session
 sbx hosts drain <HOST_ID> [--json]
-
-# Trigger immediate bin-packing defragmentation across sparse hosts
 sbx hosts compact [--json]
-
-# Simulate a sudden SIGKILL crash on a host and trigger watchdog resurrection
 sbx hosts simulate-crash <HOST_ID> [--json]
 ```
 
-#### Examples
+---
+
+### 2.22 `config` (`get`, `set`) — View and Tune Fleet-Wide Settings
+
+Reads (`GET /v1/config`) or dynamically updates (`POST /v1/config`) `fleet/config.json`. Changing
+`--host-cpu` or `--host-memory` against a deployed Cloud Run fleet automatically rolls out a new
+`sandbox-pool` revision with the updated sizing.
+
+#### Synopsis & Flags (`config set`)
 
 ```shell
-# List active host sessions
-sbx hosts list
-```
-
-```text
-HOST_ID        STATUS  ACTIVE  FREE  MAX  CPU/RAM  REVISION                INSTANCE_STATE  LAST_HEARTBEAT
-host-742e5bf0  ACTIVE  8       2     10   4/8Gi    sandbox-pool-00012-xyz  busy            07:40:15
-host-91c4e012  ACTIVE  2       8     10   4/8Gi    sandbox-pool-00012-xyz  busy            07:40:14
-```
-
-```shell
-# Compact sparse hosts onto minimal session clones
-sbx hosts compact
-# Output: Compaction result: drained=[host-91c4e012] migrated=[sbx-host-91c4e012-11223344->host-742e5bf0 sbx-host-91c4e012-55667788->host-742e5bf0] (compacted 1 sparse host(s))
-```
-
------
-
-### 2.19 `config` (`get`, `set`) — View and Tune Fleet-Wide Dispenser Settings
-
-Reads (`GET /v1/config`) or dynamically updates (`POST /v1/config`) fleet-wide
-dispenser configuration stored at `fleet/config.json`. Updating configuration
-automatically refreshes the local CLI candidate cache.
-
-> [!NOTE]
-> When `--host-cpu` or `--host-memory` is changed to a new size
-> against a live Cloud Run deployment, `sandbox-control-plane` automatically
-> reconciles `sandbox-pool` on Cloud Run to roll out a new revision with the
-> updated vCPU/RAM allocation (existing hosts gracefully drain and live-migrate
-> their sandboxes onto the new revision). Passing unchanged values is a fast
-> metadata no-op.
-
-#### Synopsis
-
-```shell
-# View current fleet configuration (always outputs indented JSON)
 sbx config get
-
-# Update fleet configuration parameters
-sbx config set \
-    [--max-density=<N>] \
-    [--host-cpu=<VCPU>] \
-    [--host-memory=<MEMORY>] \
-    [--min-free-memory-mb=<MB>] \
-    [--min-free-memory-pct=<PCT>] \
-    [--max-memory-overcommit-ratio=<RATIO>] \
-    [--hot-memory-threshold-pct=<PCT>] \
-    [--hot-cpu-threshold-pct=<PCT>] \
-    [--min-client-version=<SEMVER>] \
-    [--project=<PROJECT_ID>] \
-    [--region=<REGION>] \
-    [--periodic-sync-sec=<SECONDS>] \
-    [--default-idle-timeout=<SECONDS> | --auto-suspend=<SECONDS>] \
-    [--heartbeat-timeout-sec=<SECONDS>] \
-    [--auto-bin-pack=true|false] \
-    [--target-revision=<REVISION_NAME>] \
-    [--pool-url=<URL>]
+sbx config set [--max-density=<N>] [--host-cpu=<VCPU>] [--host-memory=<MEMORY>] \
+    [--min-free-memory-mb=<MB>] [--min-free-memory-pct=<PCT>] [--max-memory-overcommit-ratio=<RATIO>] \
+    [--hot-memory-threshold-pct=<PCT>] [--hot-cpu-threshold-pct=<PCT>] [--min-client-version=<SEMVER>] \
+    [--project=<PROJECT_ID>] [--region=<REGION>] [--periodic-sync-sec=<SEC>] \
+    [--default-idle-timeout=<SEC> | --auto-suspend=<SEC>] [--heartbeat-timeout-sec=<SEC>] \
+    [--auto-bin-pack=true|false] [--target-revision=<REV>] [--pool-url=<URL>]
 ```
 
-#### Flags (`config set`)
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--max-density` | `int` | `10` | Max concurrent sandboxes packed onto a single host clone. |
+| `--host-cpu` / `--host-memory` | `string` | `4` / `8Gi` | vCPU and RAM allocation per `sandbox-pool` host clone. |
+| `--min-free-memory-mb` | `int` | `512` | Minimum free host RAM (MiB) before `HTTP 429` (`host_memory_pressure`). |
+| `--min-free-memory-pct` | `float` | `15.0` | Minimum free host RAM `%` before `HTTP 429` (`host_memory_pressure`). |
+| `--max-memory-overcommit-ratio` | `float` | `2.0` | Max ratio of allocated sandbox memory to physical `HOST_MEMORY` (`active >= 1`). |
+| `--hot-memory-threshold-pct` | `float` | `85.0` | Host memory `%` that triggers proactive live migration (`HOT_SHEDDING`). |
+| `--hot-cpu-threshold-pct` | `float` | `90.0` | Host CPU `%` that triggers proactive live migration (`HOT_SHEDDING`). |
+| `--min-client-version` | `string` | `1.0.0` | Minimum required client semver; older clients receive `HTTP 426 Upgrade Required`. |
+| `--project` / `--region` | `string` | active / `us-west1` | GCP project and region used when rolling out `sandbox-pool` CPU/memory updates. |
+| `--periodic-sync-sec` | `int` | `10` | Stored in `FleetConfig`; `hostd` currently uses a fixed 3s dirty / 10s full sweep (see [ARCHITECTURE.md §6](ARCHITECTURE.md#6-system-timers--defaults-reference)). |
+| `--default-idle-timeout` | `int` | `0` (disabled) | Fleet-wide default auto-suspend timeout in seconds (alias: `--auto-suspend`). |
+| `--heartbeat-timeout-sec` | `int` | `15` | Seconds without a heartbeat before the watchdog declares a host `DEAD`. |
+| `--auto-bin-pack` | `bool` | `true` | Enable background bin-packing defragmentation by the control-plane leader. |
+| `--target-revision` | `string` | `""` | Target Cloud Run revision; older hosts drain and migrate sandboxes onto it. |
+| `--pool-url` | `string` | auto-configured | Override the `sandbox-pool` URL advertised via `/v1/candidates`. |
 
-| Flag                            | Type     | Default                 | Description                                                                                                                           |
-| :------------------------------ | :------- | :---------------------- | :------------------------------------------------------------------------------------------------------------------------------------ |
-| `--max-density`                 | `int`    | `10`                    | Maximum concurrent sandboxes packed onto a single `HostSession` clone.                                                                |
-| `--host-cpu`                    | `string` | `4`                     | vCPU allocation for each `sandbox-pool` host session clone (for example, `4`, `8`).                                                   |
-| `--host-memory`                 | `string` | `8Gi`                   | Memory allocation for each `sandbox-pool` host session clone (for example, `8Gi`, `16Gi`).                                            |
-| `--min-free-memory-mb`          | `int`    | `512`                   | Minimum free host RAM in MiB before rejecting new creations with `HTTP 429` (`host_memory_pressure`).                                 |
-| `--min-free-memory-pct`         | `float`  | `15.0`                  | Minimum free host RAM percentage (`0–100`) before rejecting new creations with `HTTP 429` (`host_memory_pressure`).                   |
-| `--max-memory-overcommit-ratio` | `float`  | `2.0`                   | Maximum ratio of allocated sandbox memory to physical `HOST_MEMORY` per host (`active >= 1`).                                         |
-| `--hot-memory-threshold-pct`    | `float`  | `85.0`                  | Host actual memory usage `%` that triggers proactive live migration (`HOT_SHEDDING`) before OOM.                                      |
-| `--hot-cpu-threshold-pct`       | `float`  | `90.0`                  | Host actual CPU usage `%` that triggers proactive live migration (`HOT_SHEDDING`).                                                    |
-| `--min-client-version`          | `string` | `1.0.0`                 | Minimum required `sbx` client/SDK semver (for example, `1.0.0`, `1.2.0`); older clients receive `HTTP 426 Upgrade Required`.          |
-| `--project`                     | `string` | active `gcloud` project | GCP project ID used when updating `sandbox-pool` Cloud Run host CPU/memory.                                                           |
-| `--region`                      | `string` | `us-west1`              | Cloud Run region used when updating `sandbox-pool` host CPU/memory.                                                                   |
-| `--periodic-sync-sec`           | `int`    | `10`                    | Interval in seconds between background overlay tarball syncs for `--persistent` sandboxes.                                            |
-| `--default-idle-timeout`        | `int`    | `0` (disabled)          | Fleet-wide default auto-suspend idle timeout in seconds (`0` disables fleet-wide auto-suspend by default).                            |
-| `--auto-suspend`                | `int`    | `0` (disabled)          | Alias for `--default-idle-timeout`.                                                                                                   |
-| `--heartbeat-timeout-sec`       | `int`    | `15`                    | Seconds without a heartbeat before the watchdog declares a host `DEAD` and resurrects its sandboxes.                                  |
-| `--auto-bin-pack`               | `bool`   | `true`                  | Enable or disable continuous background bin-packing defragmentation by the control-plane leader.                                      |
-| `--target-revision`             | `string` | `""`                    | Target Cloud Run revision name; hosts on older revisions automatically drain and live-migrate their sandboxes to the target revision. |
-| `--pool-url`                    | `string` | auto-configured         | Override the `sandbox-pool` service URL advertised to CLIs via `/v1/candidates`.                                                      |
-
-#### Examples
-
-**Inspect Current Configuration (`sbx config get`):**
+#### Example
 
 ```shell
 sbx config get
@@ -1311,67 +834,24 @@ sbx config get
 }
 ```
 
-**Update Host Size, Overload Protection Thresholds & Fleet Density (`sbx config
-set`):**
-
 ```shell
-sbx config set \
-    --max-density=15 \
-    --host-cpu=8 \
-    --host-memory=16Gi \
-    --min-free-memory-mb=512 \
-    --min-free-memory-pct=15 \
-    --max-memory-overcommit-ratio=2.0 \
-    --hot-memory-threshold-pct=85 \
-    --hot-cpu-threshold-pct=90 \
-    --min-client-version=1.2.0 \
-    --periodic-sync-sec=10 \
-    --heartbeat-timeout-sec=15 \
-    --auto-bin-pack=true
+# Scale host size to 8 vCPU / 16Gi and raise density to 15
+sbx config set --max-density=15 --host-cpu=8 --host-memory=16Gi
 ```
 
-```json
-{
-  "max_density": 15,
-  "host_cpu": "8",
-  "host_memory": "16Gi",
-  "min_free_memory_mb": 512,
-  "min_free_memory_pct": 15,
-  "max_memory_overcommit_ratio": 2,
-  "hot_memory_threshold_pct": 85,
-  "hot_cpu_threshold_pct": 90,
-  "min_client_version": "1.2.0",
-  "server_version": "1.2.0",
-  "target_revision": "",
-  "pool_service_url": "https://sandbox-pool-xxxxx-uw.a.run.app",
-  "control_plane_url": "https://sandbox-control-plane-xxxxx-uw.a.run.app",
-  "periodic_sync_sec": 10,
-  "default_idle_timeout_sec": 0,
-  "heartbeat_timeout_sec": 15,
-  "grace_period_sec": 600,
-  "auto_bin_pack": true,
-  "bin_pack_hysteresis": 1,
-  "updated_at": "2026-10-18T07:45:00Z"
-}
-```
+---
 
------
+### 2.23 `stats` & `metrics` — Fleet SLA and Overcommit Observability
 
-### 2.20 `stats` — View Real-Time Fleet Observability, Bin-Packing Efficiency & Uptime SLA
-
-Displays fleet-wide capacity utilization, active/draining/dead host counts,
-running/suspended sandbox counts, bin-packing efficiency percentage, cumulative
-live migrations (including hot-host shedding and memory admission rejections),
-overcommit ratios, crash recoveries, and the fleet uptime SLA percentage (`GET
-/v1/stats`).
-
-#### Synopsis
-
-```shell
-sbx stats [--json]
-```
-
-#### Example
+* **`sbx stats [--json]`**: Queries `GET /v1/stats` to display active/draining/dead hosts,
+  running/suspended sandboxes, capacity slot utilization, bin-packing efficiency, live migrations,
+  crash recoveries, and fleet uptime SLA.
+* **`sbx metrics [--host=<ID>] [--sandbox=<ID>] [--history] [--json]`**: Queries `GET /v1/metrics`
+  to display CPU/memory overcommit ratios, per-host `overload_state` (`NORMAL`, `ELEVATED`,
+  `ADMISSION_BLOCKED`, `HOT_SHEDDING`), rolling 120-sample time-series history (`--history`), and
+  automated sizing advice. See
+  **[OVERLOAD_PROTECTION.md §2](OVERLOAD_PROTECTION.md#2-real-time--historical-resource-observability-sbx-metrics)**
+  for full sample output and field definitions.
 
 ```shell
 sbx stats
@@ -1388,163 +868,63 @@ Fleet Summary (Leader: cp-a1b2c3d4)
   Fleet Uptime SLA:  99.994%
 ```
 
------
+---
 
-### 2.21 `ui` — Web Console UI (`sandbox-ui` / `sbx ui`)
+### 2.24 `ui` — Web Console UI (`sandbox-ui` / `sbx ui`)
 
-The dispenser includes an interactive **Web Console UI** (`sandbox-ui`,
-implemented in `ui.go` and `service-ui.yaml`) that serves as a
-Backend-for-Frontend (BFF) so the browser never handles raw IAM tokens directly.
+Runs or accesses the interactive **Web Console BFF** (`ui.go`):
 
-*   **Hosted Cloud Run Service (`sandbox-ui`)**: Deployed as its own Cloud Run
-    service at `https://sandbox-ui-qd4pckfcha-uw.a.run.app`, designed for
-    browser authentication via Identity-Aware Proxy (IAP) while communicating
-    with `sandbox-control-plane` and `sandbox-pool` using Cloud Run IAM.
-*   **Local Workstation Server (`sbx ui`)**: Runs the Web Console locally on
-    `http://127.0.0.1:8080`, automatically reusing the endpoints
-    (`endpoints.json`), route cache (`routes.json`), and `gcloud` OIDC token
-    cache (`token_cache.json`) in `~/.cache/sbx/`.
+* **Hosted Cloud Run Service (`sandbox-ui`)**: Deployed at
+  `https://sandbox-ui-<hash>-<region>.a.run.app` behind Cloud Identity-Aware Proxy (IAP). Discover
+  its URL with:
+  ```shell
+  gcloud run services describe sandbox-ui --region=us-west1 --format='value(status.url)'
+  ```
+* **Local Workstation Server (`sbx ui`)**: Starts the BFF locally on `http://127.0.0.1:8080`,
+  reusing `~/.cache/sbx/endpoints.json` and `token_cache.json` (or reading `CONTROL_PLANE_URL` and
+  `POOL_SERVICE_URL` from the environment):
+  ```shell
+  sbx ui
+  # Custom port or bind address:
+  PORT=9090 BIND_HOST=127.0.0.1 sbx ui
+  ```
 
-#### Synopsis
+#### Web Console Tabs & Security Hardening
 
-```shell
-# Launch the Web Console locally on http://127.0.0.1:8080
-sbx ui
+1. **Overview & Metrics (`/api/overview`, `/api/metrics`)**: Live capacity gauges, CPU/memory
+   overcommit ratios, rolling per-host resource charts, and sizing recommendations.
+2. **Sandboxes, Live SSE Exec & "Open Preview URL" (`/api/sandboxes/*`, `/proxy/<id>/<port>/*`)**:
+   Create, inspect, resize, suspend/resume, live-migrate, clone, snapshot, delete, and stream
+   real-time interactive commands (`/api/sandboxes/exec-stream`) and logs. Clicking **Open Preview
+   URL** opens `/proxy/<sandbox_id>/<port>/` on `sandbox-ui` to preview web servers inside the
+   sandbox with automatic header isolation and Wake-on-HTTP; see
+   [§2.12 `preview-url`](#212-preview-url-alias-preview--iam-authenticated-httpwebsocket-preview-urls)
+   and [ARCHITECTURE.md §5.2](ARCHITECTURE.md#52-web-console-security-uigo--cloud-iap--iam-reconciliation).
+3. **Host Instances (`/api/hosts/action`)**: Visual slot/memory bars with one-click host drain,
+   fleet bin-pack compaction, and simulated crash-recovery testing.
+4. **Config, Templates & Security (`/api/config`, `/api/templates`, `/api/security/policy`)**: Tune
+   `FleetConfig` parameters, manage custom templates, and edit Cloud IAP (`ui_access_members`) and
+   Cloud Run IAM (`backend_access_members`) policies (protected by the `self_revocation_forbidden`
+   safeguard).
+5. **Security Posture (`ui.go`)**: Enforces per-request cryptographic CSP nonces
+   (`script-src 'self' 'nonce-...'`, `frame-ancestors 'none'`, `object-src 'none'`),
+   `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, constant-time CSRF double-submit
+   cookies (`__Host-sbx_csrf` over HTTPS / `sbx_csrf` over HTTP paired with `X-CSRF-Token`), and a
+   `250 req/s` rate limiter. Local `sbx ui` binds exclusively to `127.0.0.1` unless `BIND_HOST` or
+   `K_SERVICE` is set.
 
-# Or specify a custom port / bind address via environment variables
-PORT=9090 BIND_HOST=127.0.0.1 sbx ui
-```
+---
 
-#### Web Console Features
-
-1.  **Fleet Overview & SLA Observability**: Real-time dashboard showing
-    active/draining/dead host clones, running/suspended sandboxes, capacity slot
-    utilization, bin-packing efficiency percentage, live migrations, crash
-    recoveries, and the fleet uptime SLA.
-2.  **Sandboxes Manager & Live Command Runner (`exec` & `logs`)**: Create new
-    sandboxes (choosing template, CPU/RAM, idle timeout, and persistence),
-    inspect full JSON records, dynamically resize resources in place,
-    suspend/resume, live-migrate, clone (`copy`), snapshot, delete, run
-    interactive commands (`exec`), and stream sandbox logs directly from the
-    browser.
-3.  **Host Clones & Bin-Packing Visualizer**: Visualizes each `4 vCPU / 8Gi`
-    host clone's occupied vs. free capacity slots with one-click buttons to
-    gracefully drain a host (`drain`), trigger fleet-wide bin-packing compaction
-    (`compact`), or test crash recovery (`simulate-crash`).
-4.  **Dispenser Configuration & Templates Manager**: View and edit fleet-wide
-    settings (`max_density`, `host_cpu`, `host_memory`, `periodic_sync_sec`,
-    `heartbeat_timeout_sec`, `auto_bin_pack`, `target_revision`) and register or
-    delete custom snapshot-backed templates.
-
------
-
-### 2.22 `version` (Aliases: `--version`, `-v`) — Check Client & Server Protocol Versions
-
-Prints the local `sbx` client version (`1.2.0`) and, when a control plane URL is
-configured in `~/.cache/sbx/endpoints.json`, queries `GET /v1/config` to display
-the running server version and the fleet's minimum required client version
-(`min_client_version`).
-
-#### Synopsis
-
-```shell
-sbx version [--json]
-```
-
-#### Examples
-
-```shell
-sbx version
-# Output:
-# sbx client v1.2.0 (server v1.2.0, min_client_version=1.0.0)
-
-sbx --json version
-```
-
-```json
-{
-  "client_type": "sbx-cli/go",
-  "client_version": "1.2.0",
-  "min_client_version": "1.0.0",
-  "server_version": "1.2.0"
-}
-```
-
------
-
-### 2.23 `metrics` — View Real-Time & Historical CPU, Memory & Overcommit Observability
-
-Queries `GET /v1/metrics` on `sandbox-control-plane` to display fleet-wide CPU
-and memory overcommit ratios, per-host memory/CPU utilization and overload
-protection states (`NORMAL`, `ELEVATED`, `ADMISSION_BLOCKED`, `HOT_SHEDDING`),
-per-sandbox RSS/peak memory and CPU usage, rolling historical resource samples
-(`--history`), and automated sizing/overcommit tuning recommendations. For a
-detailed guide to overcommit and overload protection, see
-**[OVERLOAD_PROTECTION.md](OVERLOAD_PROTECTION.md)**.
-
-#### Synopsis
-
-```shell
-sbx metrics \
-    [--host=<HOST_ID>] \
-    [--sandbox=<SANDBOX_ID_OR_NAME>] \
-    [--history] \
-    [--json]
-```
-
-#### Flags
-
-| Flag        | Type     | Default              | Description                                                                                              |
-| :---------- | :------- | :------------------- | :------------------------------------------------------------------------------------------------------- |
-| `--host`    | `string` | `""` (all hosts)     | Filter resource metrics and optional time-series history to a single `HostSession` ID.                   |
-| `--sandbox` | `string` | `""` (all sandboxes) | Filter resource metrics to a specific sandbox ID or name.                                                |
-| `--history` | `bool`   | `false`              | Include rolling point-in-time `HostResourceSample` time-series history (`metrics/hosts/<host_id>.json`). |
-
-#### Examples
-
-```shell
-# View fleet-wide overcommit ratios, per-host overload states, and sizing recommendations
-sbx metrics
-```
-
-```text
-Fleet Resource & Overcommit Metrics
-  Fleet Memory Overcommit Ratio: 1.5
-  Fleet CPU Overcommit Ratio:    1.25
-  Hot-Host Migrations Triggered: 1
-  Memory Admission Rejections:   2
-
-Host Resource Breakdown:
-  - host-742e5bf0: state=ELEVATED used_mem_pct=68.4% mem_overcommit=1.5x cpu_overcommit=1.25x cpu_usage=24.5%
-  - host-91c4e012: state=NORMAL used_mem_pct=21.2% mem_overcommit=0.5x cpu_overcommit=0.5x cpu_usage=8.0%
-
-Sizing & Overcommit Recommendations:
-  - Host host-742e5bf0 is overcommitted on memory (1.50x allocated vs physical 8Gi) with 68.4% actual usage; monitor peak_memory_pct or increase --host-memory=16Gi if workloads spike concurrently.
-```
-
-```shell
-# Fetch full JSON metrics and time-series history for a specific host
-sbx --json metrics --host=host-742e5bf0 --history
-```
-
------
-
-## 3\. End-to-End Cookbook Examples
+## 3. End-to-End Cookbook Examples
 
 ### Example 1: Ephemeral Python Data Science Sandbox & File Transfer
 
-Provision an isolated Python 3.12 sandbox with 2 vCPU and 2Gi RAM, upload a
-dataset and script, dynamically resize the sandbox to 4 vCPU and 4Gi RAM before
-heavy aggregation, download the resulting artifact, and clean up:
+Provision a Python 3.12 sandbox, upload a CSV dataset, dynamically resize to 4 vCPU / 4Gi RAM
+before aggregation, download the result, and clean up:
 
 ```shell
-# 1. Create the sandbox (2 vCPU / 2Gi RAM) and capture its unique sandbox_id with --quiet
-MY_SANDBOX=$(sbx create py-etl \
-    --template=python \
-    --cpu=2 \
-    --memory=2Gi \
-    --quiet)
-echo "Provisioned sandbox: $MY_SANDBOX"
+# 1. Create the sandbox (2 vCPU / 2Gi RAM) and capture its unique sandbox_id
+MY_SANDBOX=$(sbx create py-etl --template=python --cpu=2 --memory=2Gi -q)
 
 # 2. Upload local input data into /workspace/sales.csv
 cat << 'EOF' > /tmp/sales.csv
@@ -1555,10 +935,10 @@ apac,1540.75
 EOF
 sbx cp /tmp/sales.csv "$MY_SANDBOX":/workspace/sales.csv
 
-# 3. Dynamically scale up the sandbox to 4 vCPU / 4Gi RAM in place before running analysis
+# 3. Dynamically scale up the sandbox to 4 vCPU / 4Gi RAM in place
 sbx update "$MY_SANDBOX" --cpu=4 --memory=4Gi
 
-# 4. Run an inline Python aggregation script inside the sandbox
+# 4. Run an aggregation script inside the sandbox
 sbx exec "$MY_SANDBOX" -- python3 -c "
 import csv, json
 with open('/workspace/sales.csv') as f:
@@ -1568,26 +948,21 @@ with open('/workspace/summary.json', 'w') as out:
 print('Computed total_revenue:', total)
 "
 
-# 5. Download the output artifact back to the workstation and delete the sandbox
+# 5. Download the output artifact and delete the sandbox
 sbx cp "$MY_SANDBOX":/workspace/summary.json /tmp/summary.json
 cat /tmp/summary.json
 sbx delete "$MY_SANDBOX"
 ```
 
------
+---
 
 ### Example 2: Custom Environment Template & Fast Copy-on-Write Cloning
 
-Install custom packages once in a base sandbox, promote it to a reusable
-template, and fan out multiple Copy-on-Write clones in milliseconds:
+Configure a base sandbox once, promote it to a reusable template, and fan out Copy-on-Write clones:
 
 ```shell
-# 1. Create a base sandbox (2 vCPU / 2Gi RAM) and install project dependencies
-MY_SANDBOX=$(sbx create base-env \
-    --template=python \
-    --cpu=2 \
-    --memory=2Gi \
-    --quiet)
+# 1. Create a base sandbox and populate /workspace/lib/config.py
+MY_SANDBOX=$(sbx create base-env --template=python --cpu=2 --memory=2Gi -q)
 sbx exec "$MY_SANDBOX" -- sh -c "mkdir -p /workspace/lib && echo 'VERSION = \"2.1.0\"' > /workspace/lib/config.py"
 
 # 2. Register a reusable custom template directly from the live sandbox
@@ -1596,122 +971,97 @@ sbx template create custom-agent-env \
     --description="Pre-configured agent workspace with /workspace/lib/config.py" \
     --force
 
-# 3. Instantaneously fork 3 Copy-on-Write clones from the running base sandbox
+# 3. Fork 3 Copy-on-Write clones from the running base sandbox
 for i in 1 2 3; do
-  CLONE_ID=$(sbx copy "$MY_SANDBOX" "agent-branch-${i}" --quiet)
-  sbx exec "$CLONE_ID" -- python3 -c "import sys; sys.path.append('/workspace/lib'); import config; print('Clone ${i} loaded version:', config.VERSION)"
+  CLONE_ID=$(sbx copy "$MY_SANDBOX" "agent-branch-${i}" -q)
+  sbx exec "$CLONE_ID" -- python3 -c "import sys; sys.path.append('/workspace/lib'); import config; print('Clone ${i}:', config.VERSION)"
+  sbx delete "$CLONE_ID"
 done
 
-# 4. Or boot brand-new sandboxes anywhere in the fleet using `--template=custom-agent-env`
-NEW_SANDBOX=$(sbx create fresh-agent \
-    --template=custom-agent-env \
-    --cpu=1 \
-    --memory=1Gi \
-    --quiet)
+# 4. Boot a brand-new sandbox anywhere in the fleet from the custom template
+NEW_SANDBOX=$(sbx create fresh-agent --template=custom-agent-env -q)
 sbx exec "$NEW_SANDBOX" -- cat /workspace/lib/config.py
+sbx delete "$MY_SANDBOX" "$NEW_SANDBOX"
+sbx template delete custom-agent-env
 ```
 
------
+---
 
-### Example 3: Persistent PostgreSQL 16 Sandbox Surviving Live Migration & Host Crash (`RPO=0`)
+### Example 3: Persistent PostgreSQL 16 Sandbox Surviving Live Migration & Crash
 
-The built-in `postgres` template initializes a PostgreSQL 16 cluster at
-`PGDATA=/pgdata/data` using `libfakeuid.so` (`LD_PRELOAD` mapping `UID 0 ->
-999`). Because `PGDATA` resides inside the persisted overlay, all tables and
-committed transactions survive both graceful live migrations and unexpected host
-crashes:
+The built-in `postgres` template initializes PostgreSQL 16 at `PGDATA=/pgdata/data` inside the
+persisted overlay (automatically setting `persistent=true`). All committed rows survive live
+migration and watchdog crash recovery (`RPO=0`):
 
 ```shell
-# 1. Create a persistent PostgreSQL 16 sandbox (2 vCPU / 2Gi RAM) and capture its sandbox_id
-MY_SANDBOX=$(sbx create pg-orders \
-    --template=postgres \
-    --cpu=2 \
-    --memory=2Gi \
-    --persistent \
-    --quiet)
-echo "Postgres sandbox: $MY_SANDBOX"
+# 1. Create a PostgreSQL 16 sandbox (persistent=true is automatic for postgres)
+MY_PG=$(sbx create pg-orders --template=postgres --cpu=2 --memory=2Gi -q)
 
 # 2. Create a table and insert committed rows
-sbx exec "$MY_SANDBOX" -- psql -U postgres -d postgres -c "
+sbx exec "$MY_PG" -- psql -U postgres -d postgres -c "
   CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, item TEXT, amount INT);
   INSERT INTO orders (item, amount) VALUES ('gpu-node', 4), ('tpu-slice', 8);
 "
 
-# 3. Live-migrate the running PostgreSQL sandbox to a new host session
-sbx migrate "$MY_SANDBOX"
-sbx inspect "$MY_SANDBOX"
-
-# 4. Verify all rows are intact on the new host session (RPO=0)
-sbx exec "$MY_SANDBOX" -- psql -U postgres -d postgres -tAc "SELECT item, amount FROM orders ORDER BY id;"
+# 3. Live-migrate the running PostgreSQL sandbox to another host session
+sbx migrate "$MY_PG"
+sbx exec "$MY_PG" -- psql -U postgres -d postgres -tAc "SELECT item, amount FROM orders ORDER BY id;"
 # Output:
 # gpu-node|4
 # tpu-slice|8
 
-# 5. Simulate an unexpected SIGKILL crash on the current host session
-CUR_HOST=$(sbx inspect "$MY_SANDBOX" | python3 -c "import sys, json; print(json.load(sys.stdin)['host_id'])")
+# 4. Simulate an ungraceful SIGKILL crash on the current host and verify watchdog recovery
+CUR_HOST=$(sbx inspect "$MY_PG" | python3 -c "import sys, json; print(json.load(sys.stdin)['host_id'])")
 sbx hosts simulate-crash "$CUR_HOST"
-
-# 6. Verify automatic watchdog resurrection and database integrity
-sbx exec "$MY_SANDBOX" -- psql -U postgres -d postgres -tAc "SELECT COUNT(*) FROM orders;"
+sbx exec "$MY_PG" -- psql -U postgres -d postgres -tAc "SELECT COUNT(*) FROM orders;"
 # Output: 2
+
+sbx delete "$MY_PG"
 ```
 
------
+---
 
 ### Example 4: Cost Optimization with Idle Auto-Suspend, In-Guest `IDLE` Signaling & Bin-Packing
 
-You can minimize Cloud Run compute costs using three complementary mechanisms:
+You can minimize Cloud Run compute costs using three mechanisms:
 
-1.  **Per-Sandbox Idle Timeout (`--idle-timeout` / `--auto-suspend`)**:
-    Automatically snapshots and suspends a sandbox after `N` seconds (or Go
-    duration string like `5m`) without `exec`, `exec-stream`, `cp`, `proxy`, or
-    `port-forward` activity.
-2.  **In-Guest Cooperative Self-Suspend (`/var/run/instance/state`)**: A process
-    inside the sandbox can cooperatively write `IDLE` or `SUSPEND` (to suspend)
-    or `STOP` (to stop) to `/var/run/instance/state` (or
-    `$SBX_GUEST_STATE_FILE`) as soon as a batch job finishes to trigger
-    immediate suspend/stop without waiting for a timeout. Background servers
-    started with `sbx exec -d` (`--background`) or placed in
-    `/workspace/.sbx_init.sh` are automatically restarted when the sandbox
-    resumes.
-3.  **Fleet Bin-Packing (`sbx hosts compact`)**: Consolidates sandboxes from
-    under-utilized hosts onto fewer warm clones so drained clones transition
-    `/sys/class/instance/state` to `idle` and scale to zero.
-
-<!-- end list -->
+1. **Per-Sandbox Idle Timeout (`--idle-timeout` / `--auto-suspend`)**: Suspends a sandbox after `N`
+   seconds or duration (`5m`) without `exec`, `exec-stream`, `cp`, `proxy`, or `port-forward`
+   activity (and automatically enables `persistent=true`).
+2. **In-Guest Cooperative Self-Suspend (`$INSTANCE_STATE_FILE`)**: Any process inside a sandbox can
+   write `IDLE`, `SUSPEND`, `STOP`, or `STOPPED` to `$INSTANCE_STATE_FILE`
+   (`/var/run/instance/state`, also symlinked at `/workspace/.instance_state`). `hostd` polls this
+   file every `400ms` and immediately checkpoints and transitions the sandbox to `SUSPENDED`
+   without waiting for an idle timer.
+3. **Fleet Bin-Packing (`sbx hosts compact`)**: Consolidates sandboxes from sparse hosts onto fewer
+   warm clones so drained hosts scale to zero.
 
 ```shell
-# 1. Create a persistent sandbox with a 60-second idle auto-suspend timeout
-MY_SANDBOX=$(sbx create batch-worker \
-    --template=ubuntu \
-    --persistent \
-    --idle-timeout=60 \
-    --quiet)
+# 1. Create a sandbox with a 60-second idle timeout (automatically sets persistent=true)
+MY_SANDBOX=$(sbx create batch-worker --template=ubuntu --idle-timeout=60 -q)
 
-# 2. Run a job that writes artifacts to /persistent and cooperatively signals IDLE when finished
+# 2. Run a job that writes output to /persistent and signals IDLE via $INSTANCE_STATE_FILE
 sbx exec "$MY_SANDBOX" -- sh -c '
   echo "checkpoint-complete" > /persistent/status.txt
-  mkdir -p /var/run/instance
-  echo "IDLE" > /var/run/instance/state
+  echo "IDLE" > "${INSTANCE_STATE_FILE:-/var/run/instance/state}"
 '
 
-# 3. Once suspended, any subsequent `sbx exec` automatically wakes and resumes the sandbox
+# 3. Once suspended, any subsequent sbx exec wakes and resumes the sandbox automatically
 sbx exec "$MY_SANDBOX" -- cat /persistent/status.txt
 # Output: checkpoint-complete
 
-# 4. Trigger fleet-wide bin-packing compaction to consolidate sparse hosts
+# 4. Trigger fleet-wide bin-packing compaction and clean up
 sbx hosts compact
-sbx stats
+sbx delete "$MY_SANDBOX"
 ```
 
------
+---
 
-### Example 5: High-Throughput Parallel Batch Creation from Scripting
+### Example 5: High-Throughput Parallel Batch Creation
 
-Because `sbx create` routes directly to candidate hosts and generates
-collision-free `sbx-<host_id>-<8hex>` IDs even when sandboxes share the same
-`--name`, you can launch dozens of parallel sandboxes from a shell script or CI
-pipeline with zero lock contention:
+Because `sbx create` routes directly to candidate hosts and mints collision-free
+`sbx-<host_id>-<8hex>` IDs even when sandboxes share the same `--name`, you can fan out parallel
+sandboxes from a script or CI job without central lock contention:
 
 ```shell
 #!/usr/bin/env bash
@@ -1720,20 +1070,21 @@ set -euo pipefail
 IDS_FILE="$(mktemp)"
 trap 'rm -f "${IDS_FILE}"' EXIT
 
-# Launch 20 sandboxes concurrently sharing the logical name "ci-shard"
 for shard in $(seq 1 20); do
   (
-    MY_SANDBOX=$(sbx create ci-shard \
-        --template=python \
-        --metadata="shard=${shard}" \
-        --quiet)
+    MY_SANDBOX=$(sbx create ci-shard --template=python --metadata="shard=${shard}" -q)
     echo "$MY_SANDBOX" >> "${IDS_FILE}"
     sbx exec "$MY_SANDBOX" -- python3 -c "print('Completed shard ${shard} on', '$MY_SANDBOX')"
   ) &
 done
 wait
 
-echo "All 20 parallel shards completed. Cleaning up..."
-# Delete all created sandboxes in parallel
 xargs -P 10 -n 1 sbx delete < "${IDS_FILE}"
 ```
+
+---
+
+**Navigation:** [Overview & Quick Start (README.md)](README.md) ·
+**User Guide & CLI Reference (USER_GUIDE.md)** ·
+[Architecture & Maintainer Guide (ARCHITECTURE.md)](ARCHITECTURE.md) ·
+[Overload Protection (OVERLOAD_PROTECTION.md)](OVERLOAD_PROTECTION.md)

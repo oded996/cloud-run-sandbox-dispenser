@@ -106,10 +106,18 @@ type SandboxRecord struct {
 	MigrationCount         int               `json:"migration_count"`
 	CrashRecoveries        int               `json:"crash_recoveries"`
 	TotalDowntimeMs        int64             `json:"total_downtime_ms"`
-	CreatedAt              time.Time         `json:"created_at"`
-	UpdatedAt              time.Time         `json:"updated_at"`
-	LastActiveAt           time.Time         `json:"last_active_at"`
-	LastSnapshotAt         time.Time         `json:"last_snapshot_at,omitempty"`
+	// LastMigrationFreezeMs is the freeze (cutover) window of the most recent live migration:
+	// the time the sandbox was not serving requests (source sbxMu held, status MIGRATING).
+	LastMigrationFreezeMs int64 `json:"last_migration_freeze_ms,omitempty"`
+	// LastMigrationTotalMs is the end-to-end duration of the most recent live migration,
+	// including the zero-downtime Phase 1 pre-copy.
+	LastMigrationTotalMs int64 `json:"last_migration_total_ms,omitempty"`
+	// LastMigrationMode is MigrationModePrestagedDelta or MigrationModeGCSFull.
+	LastMigrationMode string    `json:"last_migration_mode,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	LastActiveAt      time.Time `json:"last_active_at"`
+	LastSnapshotAt    time.Time `json:"last_snapshot_at,omitempty"`
 }
 
 // HostRecord represents a single session-isolated Cloud Run clone in sandbox-pool,
@@ -519,11 +527,56 @@ type MigrateSandboxRequest struct {
 }
 
 // HydrateRequest is the payload for POST /__internal/hydrate on a target host.
+//
+// For Two-Phase Pre-Copy live migration (Phase 2), Prestaged is true: the target already holds a
+// warm copy of the base filesystem (from POST /__internal/prestage), so the source sends only the
+// delta of files modified since the pre-copy (DeltaTar inline, or DeltaTarBlob in the Store when
+// the delta exceeds the inline request-size limit) plus DeletedPaths. No GCS round trip is needed
+// during the cutover.
 type HydrateRequest struct {
 	Record     SandboxRecord `json:"record"`
 	OverlayTar string        `json:"overlay_tar,omitempty"`
 	Reason     string        `json:"reason"`
+
+	Prestaged    bool     `json:"prestaged,omitempty"`
+	DeltaTar     []byte   `json:"delta_tar,omitempty"`
+	DeltaTarBlob string   `json:"delta_tar_blob,omitempty"`
+	DeletedPaths []string `json:"deleted_paths,omitempty"`
+	// MigrationStartUnixMs / FreezeStartUnixMs are the source host's wall-clock timestamps for
+	// the start of Phase 1 (pre-copy) and Phase 2 (freeze), used to report total_ms / freeze_ms.
+	MigrationStartUnixMs int64 `json:"migration_start_unix_ms,omitempty"`
+	FreezeStartUnixMs    int64 `json:"freeze_start_unix_ms,omitempty"`
 }
+
+// PrestageRequest is Phase 1 of Two-Phase Pre-Copy live migration (POST /__internal/prestage,
+// alias /__session/prestage). The source host streams the base filesystem tar of a RUNNING
+// sandbox to the target host, which unpacks it and warms the container without claiming
+// ownership. The body is multipart/form-data with a "record" JSON part (this struct, without
+// BaseTarBytes) followed by a "base_tar" binary part; application/json with inline BaseTarBytes
+// (or BaseTarBlob, a Store path for tars above the inline request-size limit) is also accepted.
+type PrestageRequest struct {
+	Record       SandboxRecord `json:"record"`
+	Reason       string        `json:"reason,omitempty"`
+	SourceHostID string        `json:"source_host_id,omitempty"`
+	BaseTarBytes []byte        `json:"base_tar_bytes,omitempty"`
+	BaseTarBlob  string        `json:"base_tar_blob,omitempty"`
+}
+
+// PrestageResponse is returned by POST /__internal/prestage.
+type PrestageResponse struct {
+	SandboxID  string `json:"sandbox_id"`
+	HostID     string `json:"host_id"`
+	BaseBytes  int64  `json:"base_bytes"`
+	PrestageMs int64  `json:"prestage_ms"`
+}
+
+// Live migration modes recorded in SandboxRecord.LastMigrationMode.
+const (
+	// MigrationModePrestagedDelta: Two-Phase Pre-Copy (warm base copy + direct delta cutover).
+	MigrationModePrestagedDelta = "prestaged_delta"
+	// MigrationModeGCSFull: stop-and-copy of the full overlay through the Store (fallback).
+	MigrationModeGCSFull = "gcs_full"
+)
 
 // DeployFleetRequest is the payload for POST /v1/deploy on sandbox-control-plane.
 type DeployFleetRequest struct {
@@ -1695,4 +1748,112 @@ func GetIDToken(ctx context.Context, audience string) (string, error) {
 		tokenCacheMu.Unlock()
 	}
 	return tok, nil
+}
+
+// ---------------------------------------------------------------------------------------------
+// Preview-URL proxy header hygiene (sandbox-ui -> sandbox-control-plane -> sandbox-pool -> sandbox)
+// ---------------------------------------------------------------------------------------------
+
+// proxyStrippedHeaders are hop/identity headers that must never cross a Cloud Run service
+// boundary or reach the sandbox app.
+var proxyStrippedHeaders = map[string]bool{
+	"Host":              true,
+	"X-Forwarded-Host":  true,
+	"X-Forwarded-For":   true,
+	"X-Forwarded-Proto": true,
+	"Forwarded":         true,
+}
+
+// isProxyStrippedHeader reports whether header key (any case) must be dropped when forwarding a
+// preview/proxy request to the next hop:
+//   - X-Serverless-* (Cloud Run / GFE evaluates X-Serverless-Authorization BEFORE Authorization, so an
+//     IAP token minted for sandbox-ui makes sandbox-control-plane reject the hop with 401)
+//   - X-Goog-Iap-* and X-Goog-Authenticated-User-* (IAP identity assertions)
+//   - Authorization / Proxy-Authorization when stripAuth (each hop sets its own ID token)
+//   - Host / X-Forwarded-* / Forwarded
+func isProxyStrippedHeader(key string, stripAuth bool) bool {
+	canon := http.CanonicalHeaderKey(key)
+	lower := strings.ToLower(canon)
+	switch {
+	case strings.HasPrefix(lower, "x-serverless-"),
+		strings.HasPrefix(lower, "x-goog-iap-"),
+		strings.HasPrefix(lower, "x-goog-authenticated-user-"):
+		return true
+	case stripAuth && (canon == "Authorization" || canon == "Proxy-Authorization"):
+		return true
+	}
+	return proxyStrippedHeaders[canon]
+}
+
+// isProxyStrippedCookie reports whether a cookie belongs to IAP or the sandbox-ui session (and must
+// not be forwarded to the sandbox app).
+func isProxyStrippedCookie(name string) bool {
+	return strings.HasPrefix(name, "GCP_IAAP_") || strings.HasPrefix(name, "GCP_IAP_") ||
+		name == "__Host-sbx_csrf" || name == "sbx_csrf"
+}
+
+// filterProxyCookieHeader removes IAP and sandbox-ui cookies from a Cookie header value while
+// preserving application cookies meant for the previewed sandbox web app.
+func filterProxyCookieHeader(v string) string {
+	var kept []string
+	for _, part := range strings.Split(v, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name := part
+		if i := strings.IndexByte(part, '='); i >= 0 {
+			name = strings.TrimSpace(part[:i])
+		}
+		if isProxyStrippedCookie(name) {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	return strings.Join(kept, "; ")
+}
+
+// sanitizeProxyForwardHeaders copies src into dst, dropping identity/hop headers and IAP/UI cookies
+// (see isProxyStrippedHeader). The caller then sets the hop's own Authorization and
+// X-Serverless-Session-Id.
+func sanitizeProxyForwardHeaders(dst, src http.Header, stripAuth bool) {
+	for k, vals := range src {
+		if isProxyStrippedHeader(k, stripAuth) {
+			continue
+		}
+		if http.CanonicalHeaderKey(k) == "Cookie" {
+			for _, v := range vals {
+				if fv := filterProxyCookieHeader(v); fv != "" {
+					dst.Add("Cookie", fv)
+				}
+			}
+			continue
+		}
+		for _, v := range vals {
+			dst.Add(k, v)
+		}
+	}
+}
+
+// sanitizeProxyHeadersInPlace applies sanitizeProxyForwardHeaders to h itself (for
+// httputil.ReverseProxy Rewrite hooks operating on pr.Out.Header).
+func sanitizeProxyHeadersInPlace(h http.Header, stripAuth bool) {
+	clean := make(http.Header, len(h))
+	sanitizeProxyForwardHeaders(clean, h, stripAuth)
+	for k := range h {
+		delete(h, k)
+	}
+	for k, v := range clean {
+		h[k] = v
+	}
+}
+
+// rewriteProxyLocation keeps redirects issued by a previewed app under its proxy prefix: a
+// root-relative `Location: /login` becomes `/proxy/<sandbox>/<port>/login`.
+func rewriteProxyLocation(h http.Header, sandboxIDOrName string, port int) {
+	loc := h.Get("Location")
+	if loc == "" || !strings.HasPrefix(loc, "/") || strings.HasPrefix(loc, "//") || strings.HasPrefix(loc, "/proxy/") {
+		return
+	}
+	h.Set("Location", fmt.Sprintf("/proxy/%s/%d%s", sandboxIDOrName, port, loc))
 }

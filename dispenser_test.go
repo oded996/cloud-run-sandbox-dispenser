@@ -1698,11 +1698,16 @@ func TestMain(m *testing.M) {
 				})
 				return
 			}
+			if r.URL.Path == "/redirect" {
+				http.Redirect(w, r, "/login", http.StatusFound)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"method":     r.Method,
 				"path":       r.URL.RequestURI(),
 				"custom_hdr": r.Header.Get("X-Test-Header"),
+				"headers":    r.Header,
 			})
 		})
 		_ = http.ListenAndServe("127.0.0.1:"+portStr, mux)
@@ -2187,5 +2192,644 @@ func TestEmbeddedDeployAssetsAndCloudShellProjectDetection(t *testing.T) {
 		if f == "deploy.sh" && info.Mode().Perm()&0111 == 0 {
 			t.Fatalf("expected extracted deploy.sh to be executable, mode=%v", info.Mode())
 		}
+	}
+}
+
+// TestTwoPhasePreCopyLiveMigration verifies Two-Phase Pre-Copy live migration:
+//   - Phase 1 (POST /__internal/prestage) copies the base filesystem to the target host while the
+//     sandbox keeps RUNNING and serving exec traffic on the source host (zero downtime).
+//   - Phase 2 freezes the sandbox briefly, streams only the delta (modified/new files plus
+//     deleted paths) directly to the target in POST /__internal/hydrate (Prestaged=true), and cuts over.
+func TestTwoPhasePreCopyLiveMigration(t *testing.T) {
+	ctx := context.Background()
+	router, cp, poolTS, cpTS, store := newTestFleet(t, 5)
+	hSrc := router.getOrCreateHost("host-precopy-src")
+	hDst := router.getOrCreateHost("host-precopy-dst")
+	_ = hSrc.SyncStateAndHeartbeat(ctx)
+	_ = hDst.SyncStateAndHeartbeat(ctx)
+	_ = cp.SyncFromStore(ctx)
+
+	cli := NewCLIClient(cpTS.URL, poolTS.URL, t.TempDir())
+	var sbx SandboxRecord
+	if _, err := cli.doJSON(ctx, http.MethodPost, poolTS.URL+"/__session/create",
+		map[string]string{"X-Serverless-Session-Id": "host-precopy-src"},
+		CreateSandboxRequest{Name: "precopy-1", Template: "ubuntu", Persistent: true}, &sbx); err != nil {
+		t.Fatalf("create precopy-1 failed: %v", err)
+	}
+	if sbx.HostID != "host-precopy-src" {
+		t.Fatalf("precopy-1 created on %s, want host-precopy-src", sbx.HostID)
+	}
+	cli.SetRoute(sbx.SandboxID, sbx.HostID)
+
+	// (a) Base files that are copied during Phase 1 (pre-copy).
+	if resp, err := cli.Exec(ctx, ExecRequest{
+		SandboxID: sbx.SandboxID,
+		Command: []string{"sh", "-c", "echo base-content > /workspace/base.txt && echo delta-v1 > /workspace/delta.txt && " +
+			"echo bye > /workspace/gone.txt && mkdir -p /workspace/olddir && echo old > /workspace/olddir/f.txt"},
+	}); err != nil || resp.ExitCode != 0 {
+		t.Fatalf("seed base files failed: resp=%+v err=%v", resp, err)
+	}
+
+	// (b) Mutate the filesystem AFTER Phase 1 completed (and before the freeze): the sandbox must
+	// still be RUNNING on the source host and the target must hold a warm prestaged copy.
+	var hookMu sync.Mutex
+	hookCalls := 0
+	var hookErr error
+	hSrc.testHookAfterPrestage = func(sandboxID string) {
+		hookMu.Lock()
+		defer hookMu.Unlock()
+		hookCalls++
+		hSrc.mu.RLock()
+		srcStatus := hSrc.sandboxes[sandboxID].Status
+		hSrc.mu.RUnlock()
+		if srcStatus != StatusRunning {
+			hookErr = fmt.Errorf("source status during pre-copy = %s, want RUNNING (zero downtime)", srcStatus)
+			return
+		}
+		hDst.mu.RLock()
+		_, staged := hDst.prestaged[sandboxID]
+		_, active := hDst.sandboxes[sandboxID]
+		hDst.mu.RUnlock()
+		if !staged || active {
+			hookErr = fmt.Errorf("target prestaged=%v active=%v after Phase 1, want prestaged=true active=false", staged, active)
+			return
+		}
+		resp, err := cli.Exec(ctx, ExecRequest{
+			SandboxID: sandboxID,
+			Command: []string{"sh", "-c", "echo delta-v2 > /workspace/delta.txt && rm -f /workspace/gone.txt && " +
+				"rm -rf /workspace/olddir && mkdir -p /workspace/newdir && echo fresh > /workspace/newdir/new.txt"},
+		})
+		if err != nil || resp.ExitCode != 0 || resp.HostID != "host-precopy-src" {
+			hookErr = fmt.Errorf("mid-precopy exec failed: resp=%+v err=%v", resp, err)
+		}
+	}
+
+	// (c) Concurrent exec traffic (reads + writes) during the whole migration.
+	stopTraffic := make(chan struct{})
+	var trafficWG sync.WaitGroup
+	var trafficMu sync.Mutex
+	writesOK := map[int]string{}
+	var trafficErrs []string
+	readsOK := 0
+	trafficWG.Add(2)
+	go func() {
+		defer trafficWG.Done()
+		trafficCLI := NewCLIClient(cpTS.URL, poolTS.URL, t.TempDir())
+		trafficCLI.SetRoute(sbx.SandboxID, "host-precopy-src")
+		for i := 0; ; i++ {
+			select {
+			case <-stopTraffic:
+				return
+			default:
+			}
+			resp, err := trafficCLI.Exec(ctx, ExecRequest{
+				SandboxID: sbx.SandboxID,
+				Command:   []string{"sh", "-c", fmt.Sprintf("echo w%d > /workspace/conc-%d.txt", i, i)},
+			})
+			trafficMu.Lock()
+			if err != nil || resp.ExitCode != 0 {
+				trafficErrs = append(trafficErrs, fmt.Sprintf("write %d: resp=%+v err=%v", i, resp, err))
+			} else {
+				writesOK[i] = resp.HostID
+			}
+			trafficMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	go func() {
+		defer trafficWG.Done()
+		trafficCLI := NewCLIClient(cpTS.URL, poolTS.URL, t.TempDir())
+		trafficCLI.SetRoute(sbx.SandboxID, "host-precopy-src")
+		for {
+			select {
+			case <-stopTraffic:
+				return
+			default:
+			}
+			resp, err := trafficCLI.Exec(ctx, ExecRequest{
+				SandboxID: sbx.SandboxID,
+				Command:   []string{"cat", "/workspace/base.txt"},
+			})
+			trafficMu.Lock()
+			if err != nil || strings.TrimSpace(resp.Stdout) != "base-content" {
+				trafficErrs = append(trafficErrs, fmt.Sprintf("read: resp=%+v err=%v", resp, err))
+			} else {
+				readsOK++
+			}
+			trafficMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	time.Sleep(60 * time.Millisecond)
+
+	var migrated SandboxRecord
+	migStart := time.Now()
+	if err := cli.CallSandboxEndpoint(ctx, http.MethodPost, "/__session/migrate", sbx.SandboxID, MigrateSandboxRequest{
+		SandboxID:    sbx.SandboxID,
+		TargetHostID: "host-precopy-dst",
+	}, &migrated); err != nil {
+		t.Fatalf("two-phase migrate failed: %v", err)
+	}
+	migWall := time.Since(migStart)
+	time.Sleep(60 * time.Millisecond)
+	close(stopTraffic)
+	trafficWG.Wait()
+
+	hookMu.Lock()
+	if hookCalls != 1 || hookErr != nil {
+		t.Fatalf("after-prestage hook calls=%d err=%v", hookCalls, hookErr)
+	}
+	hookMu.Unlock()
+
+	// (d) Verify the prestaged delta cutover.
+	if migrated.HostID != "host-precopy-dst" || migrated.Status != StatusRunning {
+		t.Fatalf("migrated record = host %s status %s, want host-precopy-dst RUNNING", migrated.HostID, migrated.Status)
+	}
+	if migrated.LastMigrationMode != MigrationModePrestagedDelta {
+		t.Fatalf("LastMigrationMode = %q, want %q", migrated.LastMigrationMode, MigrationModePrestagedDelta)
+	}
+	if migrated.LastMigrationFreezeMs < 0 || migrated.LastMigrationFreezeMs >= 200 {
+		t.Fatalf("LastMigrationFreezeMs = %dms, want < 200ms", migrated.LastMigrationFreezeMs)
+	}
+	if migrated.LastMigrationTotalMs < migrated.LastMigrationFreezeMs {
+		t.Fatalf("LastMigrationTotalMs (%d) < LastMigrationFreezeMs (%d)", migrated.LastMigrationTotalMs, migrated.LastMigrationFreezeMs)
+	}
+	if migrated.TotalDowntimeMs < migrated.LastMigrationFreezeMs {
+		t.Fatalf("TotalDowntimeMs (%d) < LastMigrationFreezeMs (%d)", migrated.TotalDowntimeMs, migrated.LastMigrationFreezeMs)
+	}
+	if migrated.MigrationCount != 1 {
+		t.Fatalf("MigrationCount = %d, want 1", migrated.MigrationCount)
+	}
+	t.Logf("two-phase migration: freeze=%dms total=%dms wall=%s", migrated.LastMigrationFreezeMs, migrated.LastMigrationTotalMs, migWall)
+
+	// The source-measured freeze (source sbxMu held) is reported in the source's MIGRATE event.
+	srcFreeze := int64(-1)
+	hSrc.mu.RLock()
+	for _, evt := range hSrc.recentEvents {
+		if evt.Type == "MIGRATE" && evt.SandboxID == sbx.SandboxID {
+			if !strings.Contains(evt.Message, "freeze_ms=") || !strings.Contains(evt.Message, "total_ms=") ||
+				!strings.Contains(evt.Message, "mode="+MigrationModePrestagedDelta) {
+				t.Errorf("source MIGRATE event missing freeze_ms/total_ms/mode: %q", evt.Message)
+			}
+			if i := strings.Index(evt.Message, "freeze_ms="); i >= 0 {
+				fmt.Sscanf(evt.Message[i:], "freeze_ms=%d", &srcFreeze)
+			}
+		}
+	}
+	hSrc.mu.RUnlock()
+	if srcFreeze < 0 || srcFreeze >= 200 {
+		t.Fatalf("source-measured freeze_ms = %d, want 0 <= freeze < 200ms", srcFreeze)
+	}
+	dstEvt := false
+	hDst.mu.RLock()
+	for _, evt := range hDst.recentEvents {
+		if evt.Type == "MIGRATE" && evt.SandboxID == sbx.SandboxID &&
+			strings.Contains(evt.Message, "freeze_ms=") && strings.Contains(evt.Message, "total_ms=") {
+			dstEvt = true
+		}
+	}
+	_, stillStaged := hDst.prestaged[sbx.SandboxID]
+	hDst.mu.RUnlock()
+	if !dstEvt {
+		t.Fatalf("target host has no MIGRATE event with freeze_ms/total_ms")
+	}
+	if stillStaged {
+		t.Fatalf("target still holds a prestaged entry after cutover")
+	}
+	hSrc.mu.RLock()
+	redirect := hSrc.migratedTo[sbx.SandboxID]
+	_, srcHas := hSrc.sandboxes[sbx.SandboxID]
+	hSrc.mu.RUnlock()
+	if redirect != "host-precopy-dst" || srcHas {
+		t.Fatalf("source migratedTo=%q stillHas=%v, want redirect to host-precopy-dst", redirect, srcHas)
+	}
+
+	trafficMu.Lock()
+	if len(trafficErrs) > 0 {
+		t.Fatalf("concurrent exec traffic failed during migration (%d errors), first: %s", len(trafficErrs), trafficErrs[0])
+	}
+	if readsOK == 0 || len(writesOK) == 0 {
+		t.Fatalf("expected concurrent traffic during migration: readsOK=%d writesOK=%d", readsOK, len(writesOK))
+	}
+	sawSrc, sawDst := false, false
+	for _, hid := range writesOK {
+		sawSrc = sawSrc || hid == "host-precopy-src"
+		sawDst = sawDst || hid == "host-precopy-dst"
+	}
+	writes := make(map[int]string, len(writesOK))
+	for k, v := range writesOK {
+		writes[k] = v
+	}
+	trafficMu.Unlock()
+	if !sawSrc || !sawDst {
+		t.Fatalf("expected concurrent writes served by both source and destination, got %v", writes)
+	}
+
+	// Files on the destination host: base intact, delta updated, deletions applied, new files present.
+	check := func(cmd, want string) {
+		t.Helper()
+		resp, err := cli.Exec(ctx, ExecRequest{SandboxID: sbx.SandboxID, Command: []string{"sh", "-c", cmd}})
+		if err != nil {
+			t.Fatalf("exec %q on destination failed: %v", cmd, err)
+		}
+		if resp.HostID != "host-precopy-dst" {
+			t.Fatalf("exec %q served by %s, want host-precopy-dst", cmd, resp.HostID)
+		}
+		if strings.TrimSpace(resp.Stdout) != want {
+			t.Fatalf("exec %q stdout = %q, want %q", cmd, resp.Stdout, want)
+		}
+	}
+	check("cat /workspace/base.txt", "base-content")
+	check("cat /workspace/delta.txt", "delta-v2")
+	check("cat /workspace/newdir/new.txt", "fresh")
+	check("if [ -e /workspace/gone.txt ]; then echo present; else echo deleted; fi", "deleted")
+	check("if [ -e /workspace/olddir ]; then echo present; else echo deleted; fi", "deleted")
+	for i, hid := range writes {
+		check(fmt.Sprintf("cat /workspace/conc-%d.txt", i), fmt.Sprintf("w%d", i))
+		_ = hid
+	}
+
+	// GCS durability: the destination asynchronously checkpoints the full overlay after cutover.
+	deadline := time.Now().Add(10 * time.Second)
+	wantOverlay := fmt.Sprintf("persistence/%s/overlay-e%d.tar", sbx.SandboxID, migrated.Epoch)
+	var storeRec SandboxRecord
+	for {
+		_, _, _ = store.ReadJSON(ctx, "sandboxes/"+sbx.SandboxID+".json", &storeRec)
+		if storeRec.OverlayPath == wantOverlay || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if storeRec.HostID != "host-precopy-dst" || storeRec.OverlayPath != wantOverlay {
+		t.Fatalf("store record host=%s overlay=%s, want host-precopy-dst + %s", storeRec.HostID, storeRec.OverlayPath, wantOverlay)
+	}
+	if storeRec.LastMigrationFreezeMs != migrated.LastMigrationFreezeMs || storeRec.LastMigrationMode != MigrationModePrestagedDelta {
+		t.Fatalf("store record freeze=%d mode=%q, want %d %q", storeRec.LastMigrationFreezeMs, storeRec.LastMigrationMode,
+			migrated.LastMigrationFreezeMs, MigrationModePrestagedDelta)
+	}
+	localTar, cleanup, err := store.LocalBlobPath(ctx, wantOverlay, false)
+	if err != nil {
+		t.Fatalf("LocalBlobPath(%s) failed: %v", wantOverlay, err)
+	}
+	restoreDir := t.TempDir()
+	if err := extractTarToDir(localTar, restoreDir); err != nil {
+		t.Fatalf("extract async checkpoint failed: %v", err)
+	}
+	if cleanup != nil {
+		_ = cleanup()
+	}
+	if b, err := os.ReadFile(filepath.Join(restoreDir, "workspace/delta.txt")); err != nil || strings.TrimSpace(string(b)) != "delta-v2" {
+		t.Fatalf("async GCS checkpoint delta.txt = %q (err=%v), want delta-v2", string(b), err)
+	}
+	if _, err := os.Stat(filepath.Join(restoreDir, "workspace/gone.txt")); !os.IsNotExist(err) {
+		t.Fatalf("async GCS checkpoint still contains deleted gone.txt (err=%v)", err)
+	}
+}
+
+// TestTwoPhasePreCopyFallbackToGCS verifies that if the warm prestaged copy is lost before cutover
+// (e.g. TTL expiry or target restart), migration falls back to the full GCS stop-and-copy path.
+func TestTwoPhasePreCopyFallbackToGCS(t *testing.T) {
+	ctx := context.Background()
+	router, cp, poolTS, cpTS, _ := newTestFleet(t, 5)
+	hSrc := router.getOrCreateHost("host-fb-src")
+	hDst := router.getOrCreateHost("host-fb-dst")
+	_ = hSrc.SyncStateAndHeartbeat(ctx)
+	_ = hDst.SyncStateAndHeartbeat(ctx)
+	_ = cp.SyncFromStore(ctx)
+
+	cli := NewCLIClient(cpTS.URL, poolTS.URL, t.TempDir())
+	var sbx SandboxRecord
+	if _, err := cli.doJSON(ctx, http.MethodPost, poolTS.URL+"/__session/create",
+		map[string]string{"X-Serverless-Session-Id": "host-fb-src"},
+		CreateSandboxRequest{Name: "precopy-fb", Template: "ubuntu", Persistent: true}, &sbx); err != nil {
+		t.Fatalf("create precopy-fb failed: %v", err)
+	}
+	if resp, err := cli.Exec(ctx, ExecRequest{
+		SandboxID: sbx.SandboxID,
+		Command:   []string{"sh", "-c", "echo fb-base > /workspace/base.txt && echo fb-gone > /workspace/gone.txt"},
+	}); err != nil || resp.ExitCode != 0 {
+		t.Fatalf("seed failed: resp=%+v err=%v", resp, err)
+	}
+	hSrc.testHookAfterPrestage = func(sandboxID string) {
+		if _, err := cli.Exec(ctx, ExecRequest{
+			SandboxID: sandboxID,
+			Command:   []string{"sh", "-c", "echo fb-delta > /workspace/delta.txt && rm -f /workspace/gone.txt"},
+		}); err != nil {
+			t.Errorf("mid-precopy exec failed: %v", err)
+		}
+		// Simulate the target losing its warm copy (TTL expiry / instance restart).
+		hDst.discardPrestaged(ctx, sandboxID)
+	}
+
+	var migrated SandboxRecord
+	if err := cli.CallSandboxEndpoint(ctx, http.MethodPost, "/__session/migrate", sbx.SandboxID, MigrateSandboxRequest{
+		SandboxID:    sbx.SandboxID,
+		TargetHostID: "host-fb-dst",
+	}, &migrated); err != nil {
+		t.Fatalf("fallback migrate failed: %v", err)
+	}
+	if migrated.HostID != "host-fb-dst" || migrated.LastMigrationMode != MigrationModeGCSFull {
+		t.Fatalf("migrated host=%s mode=%q, want host-fb-dst %q", migrated.HostID, migrated.LastMigrationMode, MigrationModeGCSFull)
+	}
+	for cmd, want := range map[string]string{
+		"cat /workspace/base.txt":  "fb-base",
+		"cat /workspace/delta.txt": "fb-delta",
+		"if [ -e /workspace/gone.txt ]; then echo present; else echo deleted; fi": "deleted",
+	} {
+		resp, err := cli.Exec(ctx, ExecRequest{SandboxID: sbx.SandboxID, Command: []string{"sh", "-c", cmd}})
+		if err != nil || resp.HostID != "host-fb-dst" || strings.TrimSpace(resp.Stdout) != want {
+			t.Fatalf("exec %q after fallback: resp=%+v err=%v, want %q on host-fb-dst", cmd, resp, err, want)
+		}
+	}
+}
+
+// TestDeltaTarExportApplyLocalEngine unit-tests LocalProcessEngine.ExportDeltaTar / ApplyDeltaTar.
+func TestDeltaTarExportApplyLocalEngine(t *testing.T) {
+	ctx := context.Background()
+	src := NewLocalProcessEngine(t.TempDir())
+	dst := NewLocalProcessEngine(t.TempDir())
+	rec := SandboxRecord{SandboxID: "sbx-delta-unit", Template: "ubuntu"}
+	if err := src.Start(ctx, rec, ""); err != nil {
+		t.Fatalf("src.Start: %v", err)
+	}
+	srcRoot, _ := src.sandboxRoot(rec.SandboxID)
+	write := func(rel, content string) {
+		p := filepath.Join(srcRoot, rel)
+		_ = os.MkdirAll(filepath.Dir(p), 0755)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("workspace/keep.txt", "keep")
+	write("workspace/change.txt", "v1")
+	write("workspace/remove.txt", "remove-me")
+	write("workspace/sub/a.txt", "a")
+	write("workspace/backdated.txt", "old-content")
+	// Age the base files beyond the delta mtime slack so only real changes are re-sent.
+	hourAgo := time.Now().Add(-time.Hour)
+	for _, rel := range []string{"workspace/keep.txt", "workspace/change.txt", "workspace/remove.txt", "workspace/sub/a.txt", "workspace/backdated.txt"} {
+		_ = os.Chtimes(filepath.Join(srcRoot, rel), hourAgo, hourAgo)
+	}
+
+	since := time.Now()
+	baseTar := filepath.Join(t.TempDir(), "base.tar")
+	if err := src.ExportTar(ctx, rec, baseTar); err != nil {
+		t.Fatalf("ExportTar: %v", err)
+	}
+	if err := dst.Start(ctx, rec, baseTar); err != nil {
+		t.Fatalf("dst.Start: %v", err)
+	}
+
+	write("workspace/change.txt", "v2")
+	write("workspace/added.txt", "added")
+	_ = os.Remove(filepath.Join(srcRoot, "workspace/remove.txt"))
+	_ = os.RemoveAll(filepath.Join(srcRoot, "workspace/sub"))
+	// Backdated rewrite (e.g. `touch -d` / tar extraction): different size, old mtime.
+	write("workspace/backdated.txt", "new-longer-content")
+	old := time.Now().Add(-24 * time.Hour)
+	_ = os.Chtimes(filepath.Join(srcRoot, "workspace/backdated.txt"), old, old)
+	// Frequent background exports (post_exec / periodic) after the pre-copy must not evict the
+	// pre-copy base manifest (otherwise deletions since the base would be lost).
+	for i := 0; i < maxExportManifestsPerSandbox+3; i++ {
+		if err := src.ExportTar(ctx, rec, filepath.Join(t.TempDir(), fmt.Sprintf("bg-%d.tar", i))); err != nil {
+			t.Fatalf("background ExportTar %d: %v", i, err)
+		}
+	}
+
+	deltaTar := filepath.Join(t.TempDir(), "delta.tar")
+	deleted, err := src.ExportDeltaTar(ctx, rec, since, deltaTar)
+	if err != nil {
+		t.Fatalf("ExportDeltaTar: %v", err)
+	}
+	if !containsStr(deleted, "workspace/remove.txt") || !containsStr(deleted, "workspace/sub") {
+		t.Fatalf("deletedPaths = %v, want workspace/remove.txt and workspace/sub", deleted)
+	}
+	m, err := manifestFromTarFile(deltaTar)
+	if err != nil {
+		t.Fatalf("read delta manifest: %v", err)
+	}
+	for _, want := range []string{"workspace/change.txt", "workspace/added.txt", "workspace/backdated.txt"} {
+		if _, ok := m[want]; !ok {
+			t.Fatalf("delta tar missing %s (entries=%v)", want, m)
+		}
+	}
+	if _, ok := m["workspace/keep.txt"]; ok {
+		t.Fatalf("delta tar unexpectedly contains unchanged workspace/keep.txt")
+	}
+	if err := dst.ApplyDeltaTar(ctx, rec, deltaTar, deleted); err != nil {
+		t.Fatalf("ApplyDeltaTar: %v", err)
+	}
+	dstRoot, _ := dst.sandboxRoot(rec.SandboxID)
+	for rel, want := range map[string]string{
+		"workspace/keep.txt":      "keep",
+		"workspace/change.txt":    "v2",
+		"workspace/added.txt":     "added",
+		"workspace/backdated.txt": "new-longer-content",
+	} {
+		if b, err := os.ReadFile(filepath.Join(dstRoot, rel)); err != nil || string(b) != want {
+			t.Fatalf("dst %s = %q (err=%v), want %q", rel, string(b), err, want)
+		}
+	}
+	for _, rel := range []string{"workspace/remove.txt", "workspace/sub"} {
+		if _, err := os.Stat(filepath.Join(dstRoot, rel)); !os.IsNotExist(err) {
+			t.Fatalf("dst %s still exists after ApplyDeltaTar (err=%v)", rel, err)
+		}
+	}
+	// Path traversal in deletedPaths must be rejected.
+	if err := dst.ApplyDeltaTar(ctx, rec, deltaTar, []string{"../../etc"}); err == nil {
+		t.Fatalf("ApplyDeltaTar accepted traversal deleted path")
+	}
+	// A delta without a prior base export (no manifest) must fail so callers fall back to a full copy.
+	fresh := NewLocalProcessEngine(t.TempDir())
+	rec2 := SandboxRecord{SandboxID: "sbx-delta-nobase"}
+	_ = fresh.Start(ctx, rec2, "")
+	if _, err := fresh.ExportDeltaTar(ctx, rec2, time.Now(), filepath.Join(t.TempDir(), "x.tar")); err == nil {
+		t.Fatalf("ExportDeltaTar without a base manifest should fail")
+	}
+}
+
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUIProxyStripsCloudRunIAPAndServerlessAuthHeaders verifies that the Web UI "Open Preview URL"
+// path (sandbox-ui -> sandbox-control-plane -> sandbox-pool -> sandbox app) never forwards the
+// browser's IAP / X-Serverless-* credentials or IAP/UI cookies to the next hop (GFE would evaluate
+// X-Serverless-Authorization minted for sandbox-ui and reject the hop with 401), while preserving
+// application cookies, and that redirects issued by the app stay under the proxy prefix.
+func TestUIProxyStripsCloudRunIAPAndServerlessAuthHeaders(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore(t.TempDir())
+	router := &sessionPoolRouter{t: t, store: store, maxDensity: 5, revision: "sandbox-pool-00001-v1", hosts: make(map[string]*HostServer)}
+
+	var seenMu sync.Mutex
+	var cpSeen, poolSeen []http.Header
+	poolTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/proxy/") {
+			seenMu.Lock()
+			poolSeen = append(poolSeen, r.Header.Clone())
+			seenMu.Unlock()
+		}
+		router.ServeHTTP(w, r)
+	}))
+	t.Cleanup(poolTS.Close)
+	cfg := DefaultFleetConfig()
+	cfg.MaxDensity = 5
+	cfg.PoolServiceURL = poolTS.URL
+	cfg.BinPackHysteresis = 0
+	cp := NewControlPlaneServer(store, cfg)
+	cpTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/proxy/") {
+			seenMu.Lock()
+			cpSeen = append(cpSeen, r.Header.Clone())
+			seenMu.Unlock()
+		}
+		cp.ServeHTTP(w, r)
+	}))
+	t.Cleanup(func() {
+		cp.Close()
+		cpTS.Close()
+	})
+	router.controlPlaneURL = cpTS.URL
+	router.poolURL = poolTS.URL
+
+	h1 := router.getOrCreateHost("host-hdr-1")
+	_ = h1.SyncStateAndHeartbeat(ctx)
+	_ = cp.SyncFromStore(ctx)
+	cli := NewCLIClient(cpTS.URL, poolTS.URL, t.TempDir())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	appPort := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	sbx, err := cli.CreateSandbox(ctx, CreateSandboxRequest{Name: "hdr-preview", Template: "python", TargetHostID: "host-hdr-1"})
+	if err != nil {
+		t.Fatalf("CreateSandbox failed: %v", err)
+	}
+	testBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable failed: %v", err)
+	}
+	if _, err := cli.Exec(ctx, ExecRequest{
+		SandboxID:  sbx.SandboxID,
+		Background: true,
+		Command:    []string{"sh", "-c", fmt.Sprintf("SBX_TEST_HTTP_SERVER_PORT=%d exec %s", appPort, shellQuote(testBin))},
+	}); err != nil {
+		t.Fatalf("start background test HTTP server failed: %v", err)
+	}
+	_ = h1.SyncStateAndHeartbeat(ctx)
+	_ = cp.SyncFromStore(ctx)
+
+	uiTS := httptest.NewServer(NewUIServer(cpTS.URL, poolTS.URL, t.TempDir()))
+	t.Cleanup(uiTS.Close)
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	doUI := func(path string) (*http.Response, []byte) {
+		t.Helper()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, uiTS.URL+path, nil)
+		req.Header.Set("X-Serverless-Authorization", "Bearer bad-iap-token")
+		req.Header.Set("X-Goog-Iap-Jwt-Assertion", "bad-jwt")
+		req.Header.Set("X-Goog-Authenticated-User-Email", "accounts.google.com:dev@example.com")
+		req.Header.Set("Authorization", "Bearer browser-token")
+		req.Header.Set("Proxy-Authorization", "Basic cHJveHk=")
+		req.Header.Set("X-Sandbox-Authorization", "Bearer app-token")
+		req.Header.Set("Cookie", "GCP_IAAP_AUTH_TOKEN_123=secret; __Host-sbx_csrf=csrf; app_session=ok")
+		resp, err := noRedirect.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s via UI failed: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, body
+	}
+
+	var resp *http.Response
+	var body []byte
+	for i := 0; i < 30; i++ {
+		resp, body = doUI(fmt.Sprintf("/proxy/%s/%d/hello", sbx.SandboxID, appPort))
+		if resp.StatusCode == http.StatusOK {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("UI preview status = %d, want 200 (body=%s)", resp.StatusCode, string(body))
+	}
+	var echoed struct {
+		Path    string              `json:"path"`
+		Headers map[string][]string `json:"headers"`
+	}
+	if err := json.Unmarshal(body, &echoed); err != nil {
+		t.Fatalf("decode sandbox echo: %v (body=%s)", err, string(body))
+	}
+	if echoed.Path != "/hello" {
+		t.Fatalf("sandbox saw path %q, want /hello", echoed.Path)
+	}
+
+	forbidden := []string{"X-Serverless-Authorization", "X-Goog-Iap-Jwt-Assertion", "X-Goog-Authenticated-User-Email", "Proxy-Authorization"}
+	checkHop := func(hop string, h http.Header, wantAuth string) {
+		t.Helper()
+		for _, k := range forbidden {
+			if v := h.Values(k); len(v) > 0 {
+				t.Fatalf("%s received forbidden header %s=%v", hop, k, v)
+			}
+		}
+		cookies := strings.Join(h.Values("Cookie"), "; ")
+		if cookies != "app_session=ok" {
+			t.Fatalf("%s Cookie = %q, want only app_session=ok", hop, cookies)
+		}
+		if got := h.Get("Authorization"); got != wantAuth {
+			t.Fatalf("%s Authorization = %q, want %q", hop, got, wantAuth)
+		}
+	}
+	seenMu.Lock()
+	if len(cpSeen) == 0 || len(poolSeen) == 0 {
+		seenMu.Unlock()
+		t.Fatalf("expected proxy hops through control plane and pool, got cp=%d pool=%d", len(cpSeen), len(poolSeen))
+	}
+	cpHdr, poolHdr := cpSeen[len(cpSeen)-1], poolSeen[len(poolSeen)-1]
+	seenMu.Unlock()
+	// http:// test services: no ID token is minted, so no Authorization at all on internal hops.
+	checkHop("sandbox-control-plane", cpHdr, "")
+	checkHop("sandbox-pool", poolHdr, "")
+	if got := poolHdr.Values("X-Serverless-Session-Id"); len(got) != 1 || got[0] != "host-hdr-1" {
+		t.Fatalf("sandbox-pool X-Serverless-Session-Id = %v, want [host-hdr-1]", got)
+	}
+	if cpHdr.Get("X-Sandbox-Authorization") != "Bearer app-token" {
+		t.Fatalf("control plane lost X-Sandbox-Authorization: %v", cpHdr)
+	}
+	// The sandbox app sees only its own credentials (X-Sandbox-Authorization -> Authorization).
+	sbxHdr := http.Header(echoed.Headers)
+	checkHop("sandbox app", sbxHdr, "Bearer app-token")
+	if v := sbxHdr.Values("X-Sandbox-Authorization"); len(v) > 0 {
+		t.Fatalf("sandbox app received X-Sandbox-Authorization=%v", v)
+	}
+	if v := sbxHdr.Values("X-Serverless-Session-Id"); len(v) > 0 {
+		t.Fatalf("sandbox app received X-Serverless-Session-Id=%v", v)
+	}
+
+	// Root-relative redirects from the previewed app stay under the proxy prefix.
+	resp, body = doUI(fmt.Sprintf("/proxy/%s/%d/redirect", sbx.SandboxID, appPort))
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("redirect status = %d, want 302 (body=%s)", resp.StatusCode, string(body))
+	}
+	if want := fmt.Sprintf("/proxy/%s/%d/login", sbx.SandboxID, appPort); resp.Header.Get("Location") != want {
+		t.Fatalf("Location = %q, want %q", resp.Header.Get("Location"), want)
+	}
+
+	// Unit checks for the shared helpers.
+	if got := filterProxyCookieHeader("GCP_IAP_UID=1; a=b;sbx_csrf=x; GCP_IAAP_AUTH_TOKEN_9=z ;c=d"); got != "a=b; c=d" {
+		t.Fatalf("filterProxyCookieHeader = %q, want %q", got, "a=b; c=d")
+	}
+	loc := http.Header{"Location": []string{"//evil.example/x"}}
+	rewriteProxyLocation(loc, "s", 80)
+	if loc.Get("Location") != "//evil.example/x" {
+		t.Fatalf("protocol-relative Location must not be rewritten, got %q", loc.Get("Location"))
 	}
 }

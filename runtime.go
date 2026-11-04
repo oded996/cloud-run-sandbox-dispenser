@@ -91,6 +91,15 @@ type SandboxEngine interface {
 	DialSandboxPort(ctx context.Context, rec SandboxRecord, port int) (net.Conn, error)
 	// ExportTar exports the writable filesystem overlay (`rootfs-upper` / `/workspace` / `/pgdata` / `/persistent`) to destTarPath.
 	ExportTar(ctx context.Context, rec SandboxRecord, destTarPath string) error
+	// ExportDeltaTar exports to destTarPath only the entries created or modified since `since`,
+	// relative to the base filesystem manifest captured by the ExportTar call(s) that started at or
+	// after `since` (Phase 2 of Two-Phase Pre-Copy live migration). It returns the sandbox-relative
+	// paths (e.g. "workspace/old.txt") that existed in that base export but have since been deleted.
+	// It fails if no base export at or after `since` is known, so callers fall back to a full copy.
+	ExportDeltaTar(ctx context.Context, rec SandboxRecord, since time.Time, destTarPath string) (deletedPaths []string, err error)
+	// ApplyDeltaTar removes deletedPaths and extracts deltaTarPath over a prestaged (warm) sandbox,
+	// then (re)starts any internal database (e.g. PostgreSQL) that was quiesced during pre-staging.
+	ApplyDeltaTar(ctx context.Context, rec SandboxRecord, deltaTarPath string, deletedPaths []string) error
 	// Quiesce cleanly flushes and stops any internal database daemon (e.g. PostgreSQL) prior to final suspend/migration export.
 	Quiesce(ctx context.Context, sandboxID string) error
 	// Fork performs a fast same-host Copy-on-Write clone from sourceSandboxID to targetRec.
@@ -190,6 +199,7 @@ func SetInstanceBusyState(busy bool) string {
 type CloudRunSandboxEngine struct {
 	sharedDir string
 	mu        sync.Mutex
+	manifests manifestTracker
 }
 
 // NewCloudRunSandboxEngine initializes Cloud Run Sandbox Runtime helper scripts (`libfakeuid.so`, `tcpproxy`, `start-pg.sh`)
@@ -646,6 +656,7 @@ func (s *CloudRunSandboxEngine) ExportTar(ctx context.Context, rec SandboxRecord
 
 	// Stream /workspace, /pgdata, and /persistent via tar first so paths are canonical across restores,
 	// or fallback to `sandbox --mode=container tar <id> --file <destTarPath>`.
+	exportStart := time.Now()
 	cmd := exec.CommandContext(ctx, cloudRunSandboxBin, "--mode=container", "exec", "--", cid,
 		"sh", "-c", "mkdir -p /workspace /persistent /pgdata/data && sync && tar --no-same-owner --warning=no-file-changed -cf - -C / workspace persistent pgdata")
 	var outBuf, errBuf bytes.Buffer
@@ -655,7 +666,14 @@ func (s *CloudRunSandboxEngine) ExportTar(ctx context.Context, rec SandboxRecord
 		if err := os.MkdirAll(filepath.Dir(destTarPath), 0755); err != nil {
 			return err
 		}
-		return os.WriteFile(destTarPath, outBuf.Bytes(), 0644)
+		if err := os.WriteFile(destTarPath, outBuf.Bytes(), 0644); err != nil {
+			return err
+		}
+		// Remember the archived entry manifest for a later ExportDeltaTar (Two-Phase Pre-Copy).
+		if m, err := manifestFromTarReader(bytes.NewReader(outBuf.Bytes())); err == nil {
+			s.manifests.record(rec.SandboxID, exportStart, m)
+		}
+		return nil
 	}
 
 	// Fallback to native `sandbox --mode=container tar`
@@ -665,6 +683,144 @@ func (s *CloudRunSandboxEngine) ExportTar(ctx context.Context, rec SandboxRecord
 	if err != nil {
 		return fmt.Errorf("export tar for %s failed: %w (stderr=%s)", rec.SandboxID, err, stderr)
 	}
+	return nil
+}
+
+// cloudRunDeltaRoots are the container directories captured by ExportTar / ExportDeltaTar.
+var cloudRunDeltaRoots = []string{"workspace", "persistent", "pgdata"}
+
+// ExportDeltaTar lists /workspace, /persistent and /pgdata inside the container, selects the
+// entries created or modified since `since` (relative to the base manifests recorded by ExportTar),
+// and streams only those entries out of the container with `tar --no-recursion -T -`.
+func (s *CloudRunSandboxEngine) ExportDeltaTar(ctx context.Context, rec SandboxRecord, since time.Time, destTarPath string) ([]string, error) {
+	if err := ValidateID(rec.SandboxID); err != nil {
+		return nil, err
+	}
+	bases := s.manifests.since(rec.SandboxID, since)
+	if len(bases) == 0 {
+		return nil, fmt.Errorf("no base export manifest for sandbox %s at or after %s", rec.SandboxID, since.UTC().Format(time.RFC3339Nano))
+	}
+	cid := containerIDForSandbox(rec.SandboxID)
+	// %y type, %s size, %T@ mtime (epoch seconds), %m permission bits (octal), %p path; NUL-separated.
+	listCmd := "cd / && sync && find " + strings.Join(cloudRunDeltaRoots, " ") + " -printf '%y\\t%s\\t%T@\\t%m\\t%p\\0' 2>/dev/null; true"
+	out, stderr, _, err := s.runCmd(ctx, nil, cloudRunSandboxBin, "--mode=container", "exec", "--", cid, "sh", "-c", listCmd)
+	if err != nil {
+		return nil, fmt.Errorf("list sandbox files for delta: %w (stderr=%s)", err, stderr)
+	}
+	current := make(map[string]bool)
+	var selected []string
+	for _, rawEntry := range strings.Split(out, "\x00") {
+		fields := strings.SplitN(rawEntry, "\t", 5)
+		if len(fields) != 5 {
+			continue
+		}
+		rel := normalizeDeltaRel(fields[4])
+		if rel == "" {
+			continue
+		}
+		sig := fileSig{Type: 'x'}
+		switch fields[0] {
+		case "f":
+			sig.Type = '0'
+		case "d":
+			sig.Type = '5'
+		case "l":
+			sig.Type = '2'
+		}
+		var sockMode os.FileMode
+		if fields[0] == "s" {
+			sockMode = os.ModeSocket
+		}
+		if skipTarEntry(rel, sockMode) {
+			continue
+		}
+		if sig.Type == '0' {
+			sig.Size, _ = strconv.ParseInt(fields[1], 10, 64)
+		}
+		if mtime, pErr := strconv.ParseFloat(fields[2], 64); pErr == nil {
+			sec := int64(mtime)
+			sig.ModTime = time.Unix(sec, int64((mtime-float64(sec))*1e9))
+		}
+		if mode, pErr := strconv.ParseInt(fields[3], 8, 64); pErr == nil {
+			sig.Mode = mode & 0777
+		}
+		current[rel] = true
+		if entryNeedsDelta(rel, sig, bases, since) {
+			selected = append(selected, rel)
+		}
+	}
+	if len(current) == 0 {
+		return nil, fmt.Errorf("empty file listing for sandbox %s; refusing delta export", rec.SandboxID)
+	}
+	deleted := deletedSinceBases(current, bases)
+	if len(selected) == 0 {
+		return deleted, writeEmptyTar(destTarPath)
+	}
+	sort.Strings(selected)
+	stdin := []byte(strings.Join(selected, "\x00") + "\x00")
+	tarOut, tarErr, code, err := s.runCmd(ctx, stdin, cloudRunSandboxBin, "--mode=container", "exec", "--", cid,
+		"sh", "-c", "cd / && tar --no-same-owner --warning=no-file-changed --ignore-failed-read --no-recursion --null -T - -cf -")
+	// GNU tar exits 1 when a file changed while being read; the archive is still valid.
+	if (err != nil && code != 1) || len(tarOut) == 0 {
+		return nil, fmt.Errorf("delta tar export for %s failed: %v (exit=%d, stderr=%s)", rec.SandboxID, err, code, tarErr)
+	}
+	if err := os.MkdirAll(filepath.Dir(destTarPath), 0755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(destTarPath, []byte(tarOut), 0644); err != nil {
+		return nil, err
+	}
+	return deleted, nil
+}
+
+// ApplyDeltaTar removes deletedPaths and extracts deltaTarPath inside the prestaged container,
+// then restarts PostgreSQL for postgres sandboxes (it is quiesced during pre-staging).
+func (s *CloudRunSandboxEngine) ApplyDeltaTar(ctx context.Context, rec SandboxRecord, deltaTarPath string, deletedPaths []string) error {
+	if err := ValidateID(rec.SandboxID); err != nil {
+		return err
+	}
+	rels, err := validateDeletedPaths(deletedPaths)
+	if err != nil {
+		return err
+	}
+	for _, rel := range rels {
+		allowed := false
+		for _, root := range cloudRunDeltaRoots {
+			if strings.HasPrefix(rel, root+"/") {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("%w: deleted path %q is outside %v", ErrPathTraversal, rel, cloudRunDeltaRoots)
+		}
+	}
+	cid := containerIDForSandbox(rec.SandboxID)
+	if len(rels) > 0 {
+		stdin := []byte(strings.Join(rels, "\x00") + "\x00")
+		if _, stderr, _, err := s.runCmd(ctx, stdin, cloudRunSandboxBin, "--mode=container", "exec", "--", cid,
+			"sh", "-c", "cd / && xargs -0 -r rm -rf --"); err != nil {
+			return fmt.Errorf("apply delta deletions: %w (stderr=%s)", err, stderr)
+		}
+	}
+	if deltaTarPath != "" {
+		b, err := os.ReadFile(deltaTarPath)
+		if err != nil {
+			return err
+		}
+		if len(b) > 0 {
+			if _, stderr, _, err := s.runCmd(ctx, b, cloudRunSandboxBin, "--mode=container", "exec", "--", cid,
+				"sh", "-c", "cd / && tar --no-same-owner -xf - -C /"); err != nil {
+				return fmt.Errorf("apply delta tar: %w (stderr=%s)", err, stderr)
+			}
+		}
+	}
+	stateFile := s.stateFileFor(rec.SandboxID)
+	_ = os.WriteFile(stateFile, []byte("ACTIVE\n"), 0666)
+	if strings.Contains(strings.ToLower(rec.Template), "postgres") {
+		_, _, _, _ = s.runCmd(ctx, nil, cloudRunSandboxBin, "--mode=container", "exec", "--", cid, "sh", "-c", "/mnt/shared/bin/start-pg.sh")
+	}
+	s.AppendLog(rec.SandboxID, fmt.Sprintf("[system] Applied pre-copy delta (%d deleted paths)", len(rels)))
 	return nil
 }
 
@@ -790,6 +946,7 @@ func (s *CloudRunSandboxEngine) Stop(ctx context.Context, sandboxID string) erro
 	cid := containerIDForSandbox(sandboxID)
 	_, _, _, _ = s.runCmd(ctx, nil, cloudRunSandboxBin, "--mode=container", "delete", cid)
 	_ = os.Remove(s.stateFileFor(sandboxID))
+	s.manifests.forget(sandboxID)
 	return nil
 }
 
@@ -824,6 +981,7 @@ type LocalProcessEngine struct {
 	logs        map[string][]string
 	bgPIDs      map[string][]int
 	pgPorts     map[string]int
+	manifests   manifestTracker
 }
 
 // NewLocalProcessEngine creates a hermetic local engine rooted at rootDir.
@@ -842,6 +1000,7 @@ func NewLocalProcessEngine(rootDir string) *LocalProcessEngine {
 		logs:        make(map[string][]string),
 		bgPIDs:      make(map[string][]int),
 		pgPorts:     make(map[string]int),
+		manifests:   manifestTracker{m: make(map[string][]exportManifest)},
 	}
 }
 
@@ -919,6 +1078,21 @@ func (l *LocalProcessEngine) Start(_ context.Context, rec SandboxRecord, importT
 	_ = os.WriteFile(stateFile, []byte("ACTIVE\n"), 0644)
 	_ = os.WriteFile(filepath.Join(sbxRoot, "workspace/.instance_state"), []byte("ACTIVE\n"), 0644)
 
+	if err := l.startLocalPostgresIfNeeded(rec, sbxRoot, importTarPath != ""); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	l.alive[rec.SandboxID] = true
+	l.allowEgress[rec.SandboxID] = rec.AllowEgress
+	l.mu.Unlock()
+	ensureLocalEgressGuards(sbxRoot)
+	l.AppendLog(rec.SandboxID, fmt.Sprintf("[system] Started sandbox %s (template=%s, allow_egress=%v)", rec.SandboxID, rec.Template, rec.AllowEgress))
+	return nil
+}
+
+// startLocalPostgresIfNeeded (re)starts the sandbox-local PostgreSQL daemon if this is a postgres
+// sandbox (template or restored PG_VERSION). imported=true means pgdata was restored from a tar.
+func (l *LocalProcessEngine) startLocalPostgresIfNeeded(rec SandboxRecord, sbxRoot string, imported bool) error {
 	isPg := strings.Contains(strings.ToLower(rec.Template), "postgres")
 	if !isPg {
 		if _, statErr := os.Stat(filepath.Join(sbxRoot, "pgdata/data/PG_VERSION")); statErr == nil {
@@ -938,7 +1112,7 @@ func (l *LocalProcessEngine) Start(_ context.Context, rec SandboxRecord, importT
 			_, confErr := os.Stat(filepath.Join(pgDataDir, "postgresql.conf"))
 			_, verErr := os.Stat(filepath.Join(pgDataDir, "PG_VERSION"))
 			if os.IsNotExist(confErr) || os.IsNotExist(verErr) {
-				if importTarPath != "" && rec.Epoch > 1 {
+				if imported && rec.Epoch > 1 {
 					return fmt.Errorf("refusing to re-initdb hydrated postgres sandbox %s (epoch=%d): missing PG_VERSION or postgresql.conf after tar restore", rec.SandboxID, rec.Epoch)
 				}
 				_ = os.RemoveAll(pgDataDir)
@@ -967,12 +1141,6 @@ func (l *LocalProcessEngine) Start(_ context.Context, rec SandboxRecord, importT
 			}
 		}
 	}
-	l.mu.Lock()
-	l.alive[rec.SandboxID] = true
-	l.allowEgress[rec.SandboxID] = rec.AllowEgress
-	l.mu.Unlock()
-	ensureLocalEgressGuards(sbxRoot)
-	l.AppendLog(rec.SandboxID, fmt.Sprintf("[system] Started sandbox %s (template=%s, allow_egress=%v)", rec.SandboxID, rec.Template, rec.AllowEgress))
 	return nil
 }
 
@@ -1555,7 +1723,94 @@ func (l *LocalProcessEngine) ExportTar(_ context.Context, rec SandboxRecord, des
 			shellQuote(fmt.Sprintf("psql -h %s -p %d -U postgres -c 'CHECKPOINT;' >/dev/null 2>&1 || true", shellQuote(pgRunDir), pgPort)))
 		_ = exec.Command("/usr/bin/env", "sh", "-c", chkCmd).Run()
 	}
-	return createTarFromDir(sbxRoot, destTarPath)
+	exportStart := time.Now()
+	if err := createTarFromDir(sbxRoot, destTarPath); err != nil {
+		return err
+	}
+	// Remember the archived entry manifest so a later ExportDeltaTar (Two-Phase Pre-Copy, Phase 2)
+	// can compute modified/deleted entries relative to this export.
+	if m, err := manifestFromTarFile(destTarPath); err == nil {
+		l.manifests.record(rec.SandboxID, exportStart, m)
+	}
+	return nil
+}
+
+// ExportDeltaTar archives the entries created or modified since `since` (relative to the base
+// manifests recorded by ExportTar at or after `since`) and returns the deleted entries.
+func (l *LocalProcessEngine) ExportDeltaTar(_ context.Context, rec SandboxRecord, since time.Time, destTarPath string) ([]string, error) {
+	sbxRoot, err := l.sandboxRoot(rec.SandboxID)
+	if err != nil {
+		return nil, err
+	}
+	bases := l.manifests.since(rec.SandboxID, since)
+	if len(bases) == 0 {
+		return nil, fmt.Errorf("no base export manifest for sandbox %s at or after %s", rec.SandboxID, since.UTC().Format(time.RFC3339Nano))
+	}
+	if _, err := os.Stat(sbxRoot); err != nil {
+		return nil, fmt.Errorf("sandbox root %s missing before delta export: %w", sbxRoot, err)
+	}
+	var selected []string
+	current := make(map[string]bool)
+	_ = filepath.Walk(sbxRoot, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || path == sbxRoot {
+			return nil
+		}
+		rel, relErr := filepath.Rel(sbxRoot, path)
+		if relErr != nil {
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+		if skipTarEntry(relSlash, info.Mode()) {
+			return nil
+		}
+		current[relSlash] = true
+		if entryNeedsDelta(relSlash, sigFromFileInfo(info), bases, since) {
+			selected = append(selected, path)
+		}
+		return nil
+	})
+	sort.Strings(selected)
+	if err := writeTarFromFileList(sbxRoot, selected, destTarPath); err != nil {
+		return nil, err
+	}
+	return deletedSinceBases(current, bases), nil
+}
+
+// ApplyDeltaTar removes deletedPaths, extracts deltaTarPath over the prestaged sandbox root, and
+// restarts PostgreSQL if it was quiesced during pre-staging.
+func (l *LocalProcessEngine) ApplyDeltaTar(_ context.Context, rec SandboxRecord, deltaTarPath string, deletedPaths []string) error {
+	sbxRoot, err := l.sandboxRoot(rec.SandboxID)
+	if err != nil {
+		return err
+	}
+	rels, err := validateDeletedPaths(deletedPaths)
+	if err != nil {
+		return err
+	}
+	for _, rel := range rels {
+		target, err := SafeResolvePath(sbxRoot, rel)
+		if err != nil {
+			return err
+		}
+		if target == filepath.Clean(sbxRoot) {
+			return fmt.Errorf("%w: refusing to delete sandbox root", ErrPathTraversal)
+		}
+		if err := os.RemoveAll(target); err != nil {
+			return err
+		}
+	}
+	if deltaTarPath != "" {
+		if err := extractTarToDir(deltaTarPath, sbxRoot); err != nil {
+			return fmt.Errorf("extract delta tar: %w", err)
+		}
+	}
+	_ = os.WriteFile(filepath.Join(sbxRoot, "var/run/instance/state"), []byte("ACTIVE\n"), 0644)
+	_ = os.WriteFile(filepath.Join(sbxRoot, "workspace/.instance_state"), []byte("ACTIVE\n"), 0644)
+	if err := l.startLocalPostgresIfNeeded(rec, sbxRoot, true); err != nil {
+		return err
+	}
+	l.AppendLog(rec.SandboxID, fmt.Sprintf("[system] Applied pre-copy delta (%d deleted paths)", len(rels)))
+	return nil
 }
 
 // Quiesce cleanly stops PostgreSQL inside the local sandbox directory prior to suspend or migration.
@@ -1673,6 +1928,7 @@ func (l *LocalProcessEngine) Stop(_ context.Context, sandboxID string) error {
 	pgPort := l.pgPorts[sandboxID]
 	delete(l.pgPorts, sandboxID)
 	l.mu.Unlock()
+	l.manifests.forget(sandboxID)
 
 	for _, pid := range pids {
 		if pid > 0 {
@@ -1726,18 +1982,8 @@ func createTarFromDir(srcDir, destTarPath string) error {
 			return fmt.Errorf("corrupt pgdata directory in %s: postgresql.conf exists without PG_VERSION", srcDir)
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(destTarPath), 0755); err != nil {
-		return err
-	}
-	tmpTarPath := destTarPath + ".tmp." + NewRandomID("")
-	f, err := os.Create(tmpTarPath)
-	if err != nil {
-		return err
-	}
-	tw := tar.NewWriter(f)
-
 	var files []string
-	err = filepath.Walk(srcDir, func(path string, _ os.FileInfo, walkErr error) error {
+	err := filepath.Walk(srcDir, func(path string, _ os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return nil
 		}
@@ -1748,18 +1994,53 @@ func createTarFromDir(srcDir, destTarPath string) error {
 		return nil
 	})
 	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(srcDir); err != nil {
+		return fmt.Errorf("source directory %s removed during tar export: %w", srcDir, err)
+	}
+	sort.Strings(files)
+	return writeTarFromFileList(srcDir, files, destTarPath)
+}
+
+// skipTarEntry reports whether a sandbox-root-relative path must never be archived: transient state
+// trigger files, Postgres lock files and sockets, and Unix sockets.
+func skipTarEntry(relSlash string, mode os.FileMode) bool {
+	return relSlash == "var/run/instance/state" ||
+		relSlash == "workspace/.instance_state" ||
+		strings.HasSuffix(relSlash, "/postmaster.pid") ||
+		strings.HasSuffix(relSlash, "/postmaster.opts") ||
+		strings.HasPrefix(relSlash, "pgdata/run/") ||
+		mode&os.ModeSocket != 0
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+// writeTarFromFileList archives the given absolute paths under srcDir (names relative to srcDir)
+// into destTarPath atomically (temp file + rename).
+func writeTarFromFileList(srcDir string, files []string, destTarPath string) error {
+	if err := os.MkdirAll(filepath.Dir(destTarPath), 0755); err != nil {
+		return err
+	}
+	tmpTarPath := destTarPath + ".tmp." + NewRandomID("")
+	f, err := os.Create(tmpTarPath)
+	if err != nil {
+		return err
+	}
+	tw := tar.NewWriter(f)
+	fail := func(err error) error {
 		_ = tw.Close()
 		_ = f.Close()
 		_ = os.Remove(tmpTarPath)
 		return err
 	}
-	if _, err := os.Stat(srcDir); err != nil {
-		_ = tw.Close()
-		_ = f.Close()
-		_ = os.Remove(tmpTarPath)
-		return fmt.Errorf("source directory %s removed during tar export: %w", srcDir, err)
-	}
-	sort.Strings(files)
 	for _, path := range files {
 		info, err := os.Lstat(path)
 		if err != nil {
@@ -1770,13 +2051,7 @@ func createTarFromDir(srcDir, destTarPath string) error {
 			continue
 		}
 		relSlash := filepath.ToSlash(rel)
-		// Never archive transient state trigger files, Postgres lock files, or Unix sockets!
-		if relSlash == "var/run/instance/state" ||
-			relSlash == "workspace/.instance_state" ||
-			strings.HasSuffix(relSlash, "/postmaster.pid") ||
-			strings.HasSuffix(relSlash, "/postmaster.opts") ||
-			strings.HasPrefix(relSlash, "pgdata/run/") ||
-			info.Mode()&os.ModeSocket != 0 {
+		if skipTarEntry(relSlash, info.Mode()) {
 			continue
 		}
 		var linkTarget string
@@ -1794,19 +2069,29 @@ func createTarFromDir(srcDir, destTarPath string) error {
 		if info.IsDir() && !strings.HasSuffix(hdr.Name, "/") {
 			hdr.Name += "/"
 		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			_ = tw.Close()
-			_ = f.Close()
-			_ = os.Remove(tmpTarPath)
-			return err
-		}
-		if info.Mode().IsRegular() {
-			rf, err := os.Open(path)
-			if err != nil {
-				continue
+		if !info.Mode().IsRegular() {
+			if err := tw.WriteHeader(hdr); err != nil {
+				return fail(err)
 			}
-			_, _ = io.Copy(tw, rf)
+			continue
+		}
+		rf, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
 			_ = rf.Close()
+			return fail(err)
+		}
+		// The sandbox keeps running during pre-copy exports, so a file may shrink or grow while it
+		// is read: write exactly hdr.Size bytes (zero-padding a short read) so the archive stays
+		// valid. Such files have a fresh mtime and are re-sent by the Phase 2 delta.
+		n, _ := io.Copy(tw, io.LimitReader(rf, hdr.Size))
+		_ = rf.Close()
+		if n < hdr.Size {
+			if _, err := io.CopyN(tw, zeroReader{}, hdr.Size-n); err != nil {
+				return fail(err)
+			}
 		}
 	}
 	if err := tw.Close(); err != nil {
@@ -1852,10 +2137,15 @@ func extractTarToDir(tarPath, destDir string) error {
 			return err
 		}
 		mode := os.FileMode(hdr.Mode) & 0777
+		existing, lstatErr := os.Lstat(target)
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if mode == 0 {
 				mode = 0755
+			}
+			// Delta extraction over a live tree: replace a file/symlink that became a directory.
+			if lstatErr == nil && !existing.IsDir() {
+				_ = os.Remove(target)
 			}
 			if err := os.MkdirAll(target, mode); err != nil {
 				return err
@@ -1874,13 +2164,23 @@ func extractTarToDir(tarPath, destDir string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
 			}
-			_ = os.Remove(target)
+			if lstatErr == nil && existing.IsDir() {
+				_ = os.RemoveAll(target)
+			} else {
+				_ = os.Remove(target)
+			}
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return err
 			}
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
+			}
+			// Never write through an existing symlink, and replace a directory that became a file.
+			if lstatErr == nil && !existing.Mode().IsRegular() {
+				if err := os.RemoveAll(target); err != nil {
+					return err
+				}
 			}
 			if mode == 0 {
 				mode = 0644
@@ -1899,4 +2199,251 @@ func extractTarToDir(tarPath, destDir string) error {
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two-Phase Pre-Copy delta support (shared by LocalProcessEngine and CloudRunSandboxEngine).
+// ---------------------------------------------------------------------------------------------
+
+// deltaMtimeSlack absorbs coarse filesystem timestamp granularity: anything with an mtime within
+// this window before `since` is re-sent in the delta. Over-inclusion is always safe.
+const deltaMtimeSlack = 2 * time.Second
+
+// maxExportManifestsPerSandbox bounds how many recent ExportTar manifests are kept per sandbox
+// (older ones are merged, never silently dropped, while younger than manifestRetention).
+const maxExportManifestsPerSandbox = 4
+
+// manifestRetention is how long export manifests stay relevant; it comfortably exceeds the
+// longest possible pre-copy window (prestageTimeout + freeze).
+const manifestRetention = 15 * time.Minute
+
+// fileSig is the quick-check signature (rsync-style) of one archived filesystem entry.
+type fileSig struct {
+	Type    byte // '0' regular, '5' directory, '2' symlink, 'x' other
+	Size    int64
+	Mode    int64 // permission bits (& 0777)
+	ModTime time.Time
+	// Conflict marks an entry merged from several manifests with different signatures (or present
+	// in only some of them); it always counts as changed.
+	Conflict bool
+}
+
+func (a fileSig) differs(b fileSig) bool {
+	if a.Conflict || b.Conflict || a.Type != b.Type || a.Mode != b.Mode {
+		return true
+	}
+	if a.Type == '0' && a.Size != b.Size {
+		return true
+	}
+	d := a.ModTime.Sub(b.ModTime)
+	if d < 0 {
+		d = -d
+	}
+	// Tar headers round mtimes to whole seconds.
+	return d > time.Second
+}
+
+func sigFromFileInfo(info os.FileInfo) fileSig {
+	sig := fileSig{Type: 'x', Mode: int64(info.Mode().Perm()), ModTime: info.ModTime()}
+	switch {
+	case info.Mode().IsRegular():
+		sig.Type = '0'
+		sig.Size = info.Size()
+	case info.IsDir():
+		sig.Type = '5'
+	case info.Mode()&os.ModeSymlink != 0:
+		sig.Type = '2'
+	}
+	return sig
+}
+
+func sigFromTarHeader(hdr *tar.Header) fileSig {
+	sig := fileSig{Type: 'x', Mode: hdr.Mode & 0777, ModTime: hdr.ModTime}
+	switch hdr.Typeflag {
+	case tar.TypeReg, tar.TypeRegA:
+		sig.Type = '0'
+		sig.Size = hdr.Size
+	case tar.TypeDir:
+		sig.Type = '5'
+	case tar.TypeSymlink:
+		sig.Type = '2'
+	}
+	return sig
+}
+
+// normalizeDeltaRel canonicalizes a tar entry name or deleted path ("./workspace/a/" -> "workspace/a").
+func normalizeDeltaRel(name string) string {
+	rel := strings.TrimPrefix(filepath.ToSlash(name), "./")
+	rel = strings.Trim(rel, "/")
+	if rel == "." {
+		return ""
+	}
+	return rel
+}
+
+func manifestFromTarReader(r io.Reader) (map[string]fileSig, error) {
+	out := make(map[string]fileSig)
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if rel := normalizeDeltaRel(hdr.Name); rel != "" {
+			out[rel] = sigFromTarHeader(hdr)
+		}
+	}
+}
+
+// manifestFromTarFile reads only the headers of a tar archive (seeking past file contents).
+func manifestFromTarFile(path string) (map[string]fileSig, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return manifestFromTarReader(f)
+}
+
+type exportManifest struct {
+	at      time.Time
+	entries map[string]fileSig
+}
+
+// manifestTracker remembers the entry manifests of recent full ExportTar calls per sandbox so a
+// later ExportDeltaTar can compute modified and deleted entries relative to a pre-copied base.
+type manifestTracker struct {
+	mu sync.Mutex
+	m  map[string][]exportManifest
+}
+
+func (t *manifestTracker) record(sandboxID string, at time.Time, entries map[string]fileSig) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.m == nil {
+		t.m = make(map[string][]exportManifest)
+	}
+	list := append(t.m[sandboxID], exportManifest{at: at, entries: entries})
+	// Frequent background exports (post_exec / periodic) must never evict a pre-copy base that a
+	// pending ExportDeltaTar still needs. Instead of dropping the oldest manifest, merge it into the
+	// next one (keeping the newer start time): the union only over-includes, which is always safe.
+	for len(list) > maxExportManifestsPerSandbox {
+		oldest, next := list[0], list[1]
+		if time.Since(oldest.at) > manifestRetention {
+			list = list[1:]
+			continue
+		}
+		merged := make(map[string]fileSig, len(next.entries))
+		for rel, sig := range next.entries {
+			merged[rel] = sig
+		}
+		for rel, sig := range oldest.entries {
+			if cur, ok := merged[rel]; ok {
+				if cur.differs(sig) {
+					cur.Conflict = true
+					merged[rel] = cur
+				}
+			} else {
+				sig.Conflict = true
+				merged[rel] = sig
+			}
+		}
+		list = append([]exportManifest{{at: next.at, entries: merged}}, list[2:]...)
+	}
+	t.m[sandboxID] = list
+}
+
+// since returns every recorded manifest whose export started at or after `since`. The pre-copy
+// base is one of them; comparing against all of them is safe because over-inclusion only adds
+// entries to the delta (and deleting an already-absent path is a no-op).
+func (t *manifestTracker) since(sandboxID string, since time.Time) []exportManifest {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []exportManifest
+	for _, m := range t.m[sandboxID] {
+		if !m.at.Before(since) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (t *manifestTracker) forget(sandboxID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.m, sandboxID)
+}
+
+// entryNeedsDelta reports whether the current entry `rel` must be re-sent in the delta.
+func entryNeedsDelta(rel string, cur fileSig, bases []exportManifest, since time.Time) bool {
+	if !cur.ModTime.Before(since.Add(-deltaMtimeSlack)) {
+		return true
+	}
+	for _, b := range bases {
+		prev, ok := b.entries[rel]
+		if !ok || prev.differs(cur) {
+			return true
+		}
+	}
+	return false
+}
+
+// deletedSinceBases returns the entries present in any base manifest but absent now, pruned to
+// top-most deleted directories and sorted.
+func deletedSinceBases(current map[string]bool, bases []exportManifest) []string {
+	set := make(map[string]bool)
+	for _, b := range bases {
+		for rel, sig := range b.entries {
+			if !current[rel] && !skipTarEntry(rel, 0) && sig.Type != 'x' {
+				set[rel] = true
+			}
+		}
+	}
+	all := make([]string, 0, len(set))
+	for rel := range set {
+		all = append(all, rel)
+	}
+	sort.Strings(all)
+	out := make([]string, 0, len(all))
+	for _, rel := range all {
+		covered := false
+		for parent := filepath.Dir(rel); parent != "." && parent != "/" && parent != ""; parent = filepath.Dir(parent) {
+			if set[filepath.ToSlash(parent)] {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, rel)
+		}
+	}
+	return out
+}
+
+// validateDeletedPaths normalizes deletedPaths and rejects any traversal or root-level deletion.
+func validateDeletedPaths(deletedPaths []string) ([]string, error) {
+	out := make([]string, 0, len(deletedPaths))
+	for _, p := range deletedPaths {
+		rel := normalizeDeltaRel(p)
+		if rel == "" || strings.Contains(rel, "..") || strings.ContainsRune(rel, 0) {
+			return nil, fmt.Errorf("%w: invalid deleted path %q", ErrPathTraversal, p)
+		}
+		out = append(out, rel)
+	}
+	return out, nil
+}
+
+func writeEmptyTar(destTarPath string) error {
+	if err := os.MkdirAll(filepath.Dir(destTarPath), 0755); err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(destTarPath, buf.Bytes(), 0644)
 }

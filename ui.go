@@ -608,6 +608,9 @@ func (u *UIServer) handleUIProxy(w http.ResponseWriter, r *http.Request) {
 				pr.Out.URL.RawPath = ""
 				pr.Out.URL.RawQuery = r.URL.RawQuery
 				pr.Out.Host = parsedCP.Host
+				// Never forward the browser's IAP / X-Serverless-* credentials: GFE on
+				// sandbox-control-plane would evaluate them before our ID token and return 401.
+				sanitizeProxyHeadersInPlace(pr.Out.Header, true)
 				if strings.HasPrefix(cpBase, "https://") {
 					if tok, tokErr := GetIDToken(r.Context(), cpBase); tokErr == nil && tok != "" {
 						pr.Out.Header.Set("Authorization", "Bearer "+tok)
@@ -635,17 +638,18 @@ func (u *UIServer) handleUIProxy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	for k, vals := range r.Header {
-		for _, v := range vals {
-			outReq.Header.Add(k, v)
-		}
-	}
+	// Strip the browser's IAP / X-Serverless-* credentials and IAP/UI cookies (see
+	// sanitizeProxyForwardHeaders), then attach this service's own ID token for the next hop.
+	sanitizeProxyForwardHeaders(outReq.Header, r.Header, true)
 	if strings.HasPrefix(targetURL, "https://") {
 		if tok, tokErr := GetIDToken(r.Context(), u.client.ControlPlaneURL); tokErr == nil && tok != "" {
 			outReq.Header.Set("Authorization", "Bearer "+tok)
 		}
 	}
-	resp, err := u.client.HTTPClient.Do(outReq)
+	// The UI client must surface upstream redirects to the browser instead of following them.
+	httpClient := *u.client.HTTPClient
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := httpClient.Do(outReq)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -655,6 +659,9 @@ func (u *UIServer) handleUIProxy(w http.ResponseWriter, r *http.Request) {
 		for _, v := range vals {
 			w.Header().Add(k, v)
 		}
+	}
+	if idOrName, port, _, pErr := parseProxyPathAndPort(r); pErr == nil && strings.HasPrefix(r.URL.Path, "/proxy/") {
+		rewriteProxyLocation(w.Header(), idOrName, port)
 	}
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)

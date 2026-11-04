@@ -1519,6 +1519,7 @@ func (c *ControlPlaneServer) handlePortForwardViaCP(w http.ResponseWriter, r *ht
 			pr.Out.URL.RawPath = ""
 			pr.Out.URL.RawQuery = fmt.Sprintf("sandbox_id=%s&port=%d", url.QueryEscape(rec.SandboxID), port)
 			pr.Out.Host = parsedPool.Host
+			sanitizeProxyHeadersInPlace(pr.Out.Header, true)
 			pr.Out.Header.Set("X-Serverless-Session-Id", hostID)
 			pr.Out.Header.Set("X-Sandbox-Id", rec.SandboxID)
 			pr.Out.Header.Set("X-Sandbox-Forward-Port", strconv.Itoa(port))
@@ -1572,6 +1573,7 @@ func (c *ControlPlaneServer) handleProxyViaCP(w http.ResponseWriter, r *http.Req
 				pr.Out.URL.RawPath = ""
 				pr.Out.URL.RawQuery = r.URL.RawQuery
 				pr.Out.Host = parsedPool.Host
+				sanitizeProxyHeadersInPlace(pr.Out.Header, true)
 				pr.Out.Header.Set("X-Serverless-Session-Id", hostID)
 				pr.Out.Header.Set("X-Sandbox-Id", rec.SandboxID)
 				if strings.HasPrefix(poolURL, "https://") {
@@ -1596,6 +1598,9 @@ func (c *ControlPlaneServer) handleProxyViaCP(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// Surface the previewed app's redirects to the caller instead of following them here.
+	proxyClient := *c.httpClient
+	proxyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	var lastDoErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		tried[hostID] = true
@@ -1608,11 +1613,9 @@ func (c *ControlPlaneServer) handleProxyViaCP(w http.ResponseWriter, r *http.Req
 			writeCPJSON(w, http.StatusInternalServerError, map[string]any{"error": reqErr.Error()})
 			return
 		}
-		for k, vals := range r.Header {
-			for _, v := range vals {
-				outReq.Header.Add(k, v)
-			}
-		}
+		// Strip caller IAP / X-Serverless-* credentials and IAP/UI cookies before setting this
+		// hop's own session routing header and ID token.
+		sanitizeProxyForwardHeaders(outReq.Header, r.Header, true)
 		outReq.Header.Set("X-Serverless-Session-Id", hostID)
 		outReq.Header.Set("X-Sandbox-Id", rec.SandboxID)
 		if strings.HasPrefix(poolURL, "https://") {
@@ -1621,7 +1624,7 @@ func (c *ControlPlaneServer) handleProxyViaCP(w http.ResponseWriter, r *http.Req
 			}
 		}
 
-		resp, doErr := c.httpClient.Do(outReq)
+		resp, doErr := proxyClient.Do(outReq)
 		if doErr != nil {
 			lastDoErr = doErr
 			_, hostID = c.selectOrMintProxyHost(rec, tried)
@@ -1658,6 +1661,7 @@ func (c *ControlPlaneServer) handleProxyViaCP(w http.ResponseWriter, r *http.Req
 		}
 		w.Header().Set("X-Sandbox-Host-Session", hostID)
 		w.Header().Set("X-Sandbox-Id", rec.SandboxID)
+		rewriteProxyLocation(w.Header(), idOrName, port)
 		w.WriteHeader(resp.StatusCode)
 		flusher, _ := w.(http.Flusher)
 		buf := make([]byte, 32*1024)
