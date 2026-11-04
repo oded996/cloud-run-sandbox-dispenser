@@ -1,0 +1,100 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: sandbox-pool
+  labels:
+    cloud.googleapis.com/location: us-west1
+  annotations:
+    run.googleapis.com/launch-stage: ALPHA
+    run.googleapis.com/scalingMode: session
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: '0'
+        autoscaling.knative.dev/maxScale: '50'
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/cpu-throttling: 'false'
+        run.googleapis.com/startup-cpu-boost: 'true'
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 600
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: hostd
+        image: IMAGE_URI_PLACEHOLDER
+        ports:
+        - name: http1
+          containerPort: 8080
+        env:
+        - name: DISPENSER_MODE
+          value: hostd
+        - name: GOOGLE_CLOUD_PROJECT
+          value: PROJECT_ID_PLACEHOLDER
+        - name: GCS_BUCKET_NAME
+          value: BUCKET_NAME_PLACEHOLDER
+        - name: GCS_MOUNT_ROOT
+          value: /mnt/gcs
+        - name: CONTROL_PLANE_URL
+          value: CONTROL_PLANE_URL_PLACEHOLDER
+        - name: POOL_SERVICE_URL
+          value: POOL_SERVICE_URL_PLACEHOLDER
+        - name: MAX_DENSITY
+          value: '10'
+        - name: HOST_CPU
+          value: 'HOST_CPU_PLACEHOLDER'
+        - name: HOST_MEMORY
+          value: HOST_MEMORY_PLACEHOLDER
+        resources:
+          limits:
+            cpu: 'HOST_CPU_PLACEHOLDER'
+            memory: HOST_MEMORY_PLACEHOLDER
+        sandboxLauncher: true
+        startupProbe:
+          failureThreshold: 1
+          periodSeconds: 240
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 240
+        volumeMounts:
+        - name: shared-volume
+          mountPath: /mnt/shared
+        - name: gcs-store
+          mountPath: /mnt/gcs
+      # Note: On projects enabled for Cloud Run pre-warmed sandbox templates,
+      # uncomment `sandboxes.templates` below to pre-warm python/node/ubuntu micro-containers.
+      # When `/run/gcp/sandbox/sandbox.sock` is present, hostd automatically uses CloudRunSandboxEngine;
+      # otherwise it transparently runs isolated sandboxes via LocalProcessEngine.
+      # sandboxes:
+      #   templates:
+      #   - name: python
+      #     image: python:3.12-slim
+      #     command: ["/bin/sh", "-c", "mkdir -p /workspace /persistent && exec sleep infinity"]
+      #     volumeMounts:
+      #     - name: shared-volume
+      #       mountPath: /mnt/shared
+      #   - name: node
+      #     image: node:22-slim
+      #     command: ["/bin/sh", "-c", "mkdir -p /workspace /persistent && exec sleep infinity"]
+      #     volumeMounts:
+      #     - name: shared-volume
+      #       mountPath: /mnt/shared
+      #   - name: ubuntu
+      #     image: IMAGE_URI_PLACEHOLDER
+      #     command: ["/bin/sh", "-c", "mkdir -p /workspace /persistent && exec sleep infinity"]
+      #     volumeMounts:
+      #     - name: shared-volume
+      #       mountPath: /mnt/shared
+      volumes:
+      - name: shared-volume
+        emptyDir:
+          medium: Memory
+      - name: gcs-store
+        csi:
+          driver: gcsfuse.run.googleapis.com
+          volumeAttributes:
+            bucketName: BUCKET_NAME_PLACEHOLDER
+  traffic:
+  - latestRevision: true
+    percent: 100
