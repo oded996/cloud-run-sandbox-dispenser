@@ -1684,7 +1684,16 @@ func (l *LocalProcessEngine) DialSandboxPort(ctx context.Context, rec SandboxRec
 			l.mu.RUnlock()
 			listening, owned := isLocalPortOwnedBySandbox(rec.SandboxID, targetPort, bgPIDs)
 			if listening && !owned {
-				return nil, fmt.Errorf("SSRF protection: refusing to proxy port %d which is not owned by sandbox %s", targetPort, rec.SandboxID)
+				if targetPort == 8080 {
+					if l8000, o8000 := isLocalPortOwnedBySandbox(rec.SandboxID, 8000, bgPIDs); l8000 && o8000 {
+						targetPort = 8000
+						addr = "127.0.0.1:8000"
+						listening, owned = true, true
+					}
+				}
+				if listening && !owned {
+					return nil, fmt.Errorf("SSRF protection: refusing to proxy port %d which is not owned by sandbox %s", targetPort, rec.SandboxID)
+				}
 			}
 		}
 		d := net.Dialer{Timeout: 200 * time.Millisecond}
