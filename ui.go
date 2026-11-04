@@ -2027,9 +2027,9 @@ const consoleHTMLTemplate = `<!DOCTYPE html>
           <div style="font-weight:600;margin-bottom:8px;">HTTP / WebSocket Preview URL (/proxy/)</div>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
             <label for="drawer-preview-port" style="font-size:12px;color:var(--text-secondary);">Port:</label>
-            <input class="input mono" id="drawer-preview-port" type="number" min="1" max="65535" value="8080" style="width:100px;height:28px;">
+            <input class="input mono" id="drawer-preview-port" type="number" min="1" max="65535" value="8000" style="width:100px;height:28px;">
             <button class="btn btn-sm btn-primary" id="btn-drawer-open-preview" type="button">Open Preview URL</button>
-            <span class="mono" style="font-size:11.5px;color:var(--text-secondary);" id="drawer-preview-path-hint">/proxy/&lt;sandbox_id&gt;/8080/</span>
+            <span class="mono" style="font-size:11.5px;color:var(--text-secondary);" id="drawer-preview-path-hint">/proxy/&lt;sandbox_id&gt;/8000/</span>
           </div>
         </div>
 
@@ -2817,7 +2817,7 @@ const consoleHTMLTemplate = `<!DOCTYPE html>
           document.getElementById('drawer-idle').value = String(sbx.idle_timeout_sec || 0);
           document.getElementById('drawer-allow-egress').value = sbx.allow_egress ? 'true' : 'false';
         }
-        var pPort = document.getElementById('drawer-preview-port').value || '8080';
+        var pPort = document.getElementById('drawer-preview-port').value || '8000';
         document.getElementById('drawer-preview-path-hint').textContent = '/proxy/' + sandboxID + '/' + pPort + '/';
         var btnWrap = document.getElementById('drawer-lifecycle-buttons');
         btnWrap.replaceChildren();
@@ -2979,14 +2979,14 @@ const consoleHTMLTemplate = `<!DOCTYPE html>
       });
 
       document.getElementById('drawer-preview-port').addEventListener('input', function() {
-        var pPort = document.getElementById('drawer-preview-port').value || '8080';
+        var pPort = document.getElementById('drawer-preview-port').value || '8000';
         var sid = selectedSandboxID || '<sandbox_id>';
         document.getElementById('drawer-preview-path-hint').textContent = '/proxy/' + sid + '/' + pPort + '/';
       });
 
       document.getElementById('btn-drawer-open-preview').addEventListener('click', function() {
         if (!selectedSandboxID) return;
-        var pPort = parseInt(document.getElementById('drawer-preview-port').value || '8080', 10);
+        var pPort = parseInt(document.getElementById('drawer-preview-port').value || '8000', 10);
         if (!pPort || pPort < 1 || pPort > 65535) {
           showToast('Invalid preview port (must be 1..65535)', 'error');
           return;
